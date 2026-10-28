@@ -100,14 +100,14 @@ LANG_SPECS = {
         doc_prefixes=("/**",),
     ),
     "Ruby": LangSpec(
-        "Ruby", "#", ("=begin", "=end"),
+        "Ruby", "#", "=begin", "=end",
         doc_prefixes=("#",),
     ),
     "Shell": LangSpec(
         "Shell", "#", doc_prefixes=("#",),
     ),
     "PowerShell": LangSpec(
-        "PowerShell", "#", ("<#", "#>"),
+        "PowerShell", "#", "<#", "#>",
         doc_prefixes=("#", "<#"),
     ),
     "SQL": LangSpec(
@@ -115,7 +115,7 @@ LANG_SPECS = {
         doc_prefixes=("--",),
     ),
     "Lua": LangSpec(
-        "Lua", "--", ("--[[", "]]"),
+        "Lua", "--", "--[[", "]]",
         doc_prefixes=("---", "--[[", "--"),
     ),
     "R": LangSpec(
@@ -127,14 +127,14 @@ LANG_SPECS = {
     ),
     "Scala": LangSpec(
         "Scala", "//", *_BLOCK_C,
-        doc_prefixes=("/**",),
+        doc_prefixes=("/**",), nesting=True,
     ),
     "Dart": LangSpec(
         "Dart", "//", *_BLOCK_C,
-        doc_prefixes=("///", "/**"),
+        doc_prefixes=("///", "/**"), nesting=True,
     ),
     "Perl": LangSpec(
-        "Perl", "#", ("=pod", "=cut"),
+        "Perl", "#", "=pod", "=cut",
         doc_prefixes=("#",),
     ),
 }

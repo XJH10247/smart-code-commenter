@@ -3,6 +3,10 @@
 本文件是 `smart-code-commenter` 的详细风格规范（progressive disclosure 二级资源），
 按需查阅对应章节。所有模板中的中文描述在用户要求英文注释时替换为英文，结构不变。
 
+模板只说明格式，不是可直接复制的业务事实。参数名以实际签名为准；事务回滚、线程安全、异常、标识符格式等描述必须有源码或用户提供的依据。不适用的章节省略，无法确认的内容放入结果报告，不批量写 TODO 占位。格式允许时不重复类型系统已有的类型；NumPy 等格式所需的类型栏沿用项目约定。
+
+生成风格、符号统计、参数检查和安全校验是不同能力。脚本参数检查仅覆盖 Python Google/NumPy 章节；这里的其他格式示例不表示已有自动检查或修复实现。shebang、编码声明、Go 构建约束、lint/type 指令等不得当作普通说明注释修改。
+
 风格依据：[PEP 257](https://peps.python.org/pep-0257/)、
 [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)、
 [JSDoc](https://jsdoc.app/)、[TSDoc](https://tsdoc.org/)、
@@ -41,7 +45,7 @@ def transfer(from_account: str, to_account: str, amount: Decimal) -> str:
 - 参数描述跨多行时续行再缩进一级，与参数名区分；
 - 类 docstring 描述职责与典型用法，`Attributes:` 段列公开属性；
 - 项目已用 NumPy 风格（`Parameters\n----------`）或 reST 风格（`:param x:`）时跟随项目；
-- TODO 注释统一为 `TODO(username): 描述`（Google 风格；可用 `TODO(确认)` 表示待业务确认）。
+- 保留已有 TODO 约定，但不要把模型无法确认的业务含义自动写为 TODO；将问题列入结果报告。
 
 NumPy 风格对照（同一函数的等价写法）：
 
@@ -220,8 +224,7 @@ func settleMonth(t time.Time) (time.Time, error) {
 package order
 ```
 
-> `// Deprecated:` 若和普通文本挤在同一段，**不会**触发弃用提示。必须是独立段落，
-> 且首选写法是紧跟其后再空一行。扫描器会对此给出提醒。
+> `// Deprecated:` 应作为独立段落并与其他文本用空行分隔。当前扫描器不校验该格式，生成后需按项目的 Go 文档工具或人工复核。
 
 ## §5 C / C++ — Doxygen
 
@@ -526,7 +529,9 @@ List<Order> mergeOrders(List<Order> orders) { ... }
 | `# 正则匹配` | `# 匹配 ISO8601 且强制毫秒段，旧客户端不带毫秒需走 fallback` |
 | `// i 加 1` | `// 跳过表头行，数据从索引 1 开始` |
 | `// 返回结果` | `// 返回副本而非引用：调用方会就地排序，不能污染缓存` |
-| `// TODO: 优化` | `// TODO(确认): 单批超 1 万条时内存翻倍，需评估是否改流式` |
+| `// TODO: 优化` | 无测量依据时不新增源码注释，在报告中请求验证性能瓶颈 |
+
+以上具体约束必须先由源码、测试或用户提供的背景确认；不能仅因模板看起来专业就复制。
 
 ### 什么样的代码**不需要**行内注释
 

@@ -1,27 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""零逻辑变更安全校验器（smart-code-commenter 配套工具）。
-
-比较"加注释前"与"加注释后"两个版本的源码，验证除注释/docstring 外
-没有任何代码变化。
-
-判定策略（按可靠性递进降级）：
-    1. Python 且两版均可解析 → 剥离 docstring 后比较 AST（最精确）；
-    2. Python 但存在语法错误 → 先做 **docstring 归一化**（把 docstring
-       文本替换为哨兵）再做 token 序列比较。这是对旧版的关键修复：
-       旧版直接比对 token，而 docstring 在 token 层面是普通 STRING，
-       导致"给语法错误的代码补注释"这一官方支持的场景必然误报
-       UNSAFE 并触发回滚；
-    3. 其他语言 → 字符串感知地剥离注释、规范化空白后比较。
-
-退出码：
-    0  SAFE   仅注释发生变化，可安全保留
-    1  UNSAFE 检测到代码逻辑变化，必须回滚
-    2  ERROR  输入错误（文件不存在、无法读取等）
-
-用法：
-    python safety_check.py <原始文件> <修改后文件> [--verbose] [--quiet]
-"""
+"""有限范围的源码比较：SAFE / UNSAFE / UNVERIFIED，退出码 0 / 1 / 3；输入错误为 2。"""
 
 from __future__ import annotations
 
@@ -36,23 +15,36 @@ from typing import List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from langspec import (  # noqa: E402
-    MAX_FILE_BYTES,
-    detect_language,
-    spec_for,
-)
+from langspec import MAX_FILE_BYTES, detect_language, spec_for  # noqa: E402
 import langspec as ls  # noqa: E402
 
-_SENTINEL_BODY = "__SCC_DOCSTRING__"
-_DOCSTRING_SENTINEL = '"%s"' % _SENTINEL_BODY
 
+_DIRECTIVE = re.compile(
+    r"(?im)(?:^#!|coding\s*[:=]|"
+    r"\bgo\s*:|^//\s*\+build\b|^(?://|/\*)\s*(?:line|extern|export)\s|\bcgo\b|"
+    r"\b(?:noqa|nosec|nolint|eslint|jshint|jslint|tslint|pylint|ruff|"
+    r"pyright|mypy|shellcheck|rubocop|prettier|istanbul|coverage)\b|"
+    r"@(?:ts-(?:check|nocheck|ignore|expect-error)|flow|noflow|type|typedef|"
+    r"jsx\w*|cc_on)\b|<reference\b|"
+    r"\btype\s*:|\b(?:fmt|yapf|isort)\s*:|\bpragma\b|"
+    r"\b(?:frozen_string_literal|warn_indent|shareable_constant_value)\s*:|"
+    r"\bsource(?:Mapping)?URL\s*=|^/\*(?:!|\+|M!))"
+)
+_TRAILING_SPACE = re.compile(r"[ \t\r\n]*")
+_LINE_END = re.compile(r"[\r\n]")
+_WORD = re.compile(
+    r"(?:[^\W\d]|[$])(?:\w|[$])*|(?:\d|\.\d)(?:[\w.]|(?<=[eEpP])[+-])*",
+    re.UNICODE,
+)
+_OPERATOR = re.compile(
+    r">>>=|<<=|>>=|===|!==|>>>|\*\*=|&&=|\|\|=|\?\?=|<=>|\.\.\.|\?\.\.|"
+    r"->\*|\.\*|::|->|=>|==|!=|~=|<=|>=|\+\+|--|&&|\|\||\?\?|\?\.|"
+    r"\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>|\*\*|//|:=|\.\.|##|[^\s]"
+)
 
-# ---------------------------------------------------------------------------
-# 读取
-# ---------------------------------------------------------------------------
 
 def read_text(path: str) -> Optional[str]:
-    """多编码回退读取；失败返回 None 而非抛异常。"""
+    """多编码回退读取；失败返回 None。"""
     try:
         with open(path, "rb") as f:
             raw = f.read(MAX_FILE_BYTES + 1)
@@ -60,22 +52,41 @@ def read_text(path: str) -> Optional[str]:
         return None
     if len(raw) > MAX_FILE_BYTES:
         return None
-    if b"\x00" in raw[:4096] and raw[:2] not in (b"\xff\xfe", b"\xfe\xff"):
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeError:
+            return None
+    if b"\x00" in raw[:4096]:
         return None
-    for enc in ("utf-8-sig", "utf-16", "utf-8", "gbk", "big5", "latin-1"):
+    header = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
+    header = b"\n".join(header.split(b"\n", 2)[:2])
+    if re.search(br"(?m)^[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+", header):
+        try:
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+            return raw.decode(encoding)
+        except (UnicodeError, SyntaxError, LookupError):
+            return None
+    for enc in ("utf-8-sig", "gbk", "big5", "latin-1"):
         try:
             return raw.decode(enc)
-        except (UnicodeDecodeError, UnicodeError, LookupError):
+        except (UnicodeError, LookupError):
             continue
     return None
 
 
-# ---------------------------------------------------------------------------
-# Python：AST 级比较
-# ---------------------------------------------------------------------------
+def _protected_comment(source: str, start: int, end: int) -> Optional[str]:
+    text = source[start:end]
+    if not _DIRECTIVE.search(text):
+        return None
+    line = source.count("\n", 0, start) + 1
+    column = start - source.rfind("\n", 0, start) - 1
+    following = _TRAILING_SPACE.match(source, end).group()
+    return repr((line, column, text, following))
+
 
 class _DocstringStripper(ast.NodeTransformer):
-    """移除模块/类/函数的 docstring 节点，使比较只关注可执行逻辑。"""
+    """只移除模块、类、函数的首个字符串语句。"""
 
     @staticmethod
     def _strip(node):
@@ -84,8 +95,7 @@ class _DocstringStripper(ast.NodeTransformer):
                 and isinstance(node.body[0].value, ast.Constant)
                 and isinstance(node.body[0].value.value, str)):
             node.body = node.body[1:]
-            if not node.body:
-                # docstring 是唯一语句时补一个 pass，保持结构合法
+            if not node.body and not isinstance(node, ast.Module):
                 node.body = [ast.Pass()]
         return node
 
@@ -107,397 +117,374 @@ class _DocstringStripper(ast.NodeTransformer):
 
 
 def python_fingerprint(source: str) -> Optional[str]:
-    """返回剥离 docstring 后的 AST 指纹；语法错误返回 None。"""
+    """有效 Python 去除真正 docstring 后的 AST 指纹。"""
     try:
         tree = ast.parse(source)
-        tree = _DocstringStripper().visit(tree)
-        return ast.dump(tree, include_attributes=False)
+        compile(tree, "<safety_check>", "exec", dont_inherit=True)
+        return ast.dump(_DocstringStripper().visit(tree), include_attributes=False)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
 
 
-def _normalize_python_docstrings(source: str) -> str:
-    """把 docstring 文本替换为哨兵，供 token 级比较使用。
-
-    这是对旧版的关键修复。旧版在 AST 不可用时直接比较 token 序列，
-    而 docstring 与普通字符串在 token 层面无从区分，于是
-    "给含语法错误的代码补 docstring" 会被判为逻辑变更（UNSAFE），
-    导致该官方支持的场景必然回滚。
-
-    实现思路：源码本身有语法错误，无法用 ``ast`` 分析，因此改用
-    ``tokenize`` 逐 token 扫描（tokenize 对多数错误容忍度更高），
-    按**位置规则**判断某个字符串字面量是否为 docstring：
-
-        - 该字符串是所在缩进块的**第一条**语句，或
-        - 它是整个文件的第一个语句。
-
-    这个条件比语法定义更严格，因此不会把真实数据字符串误判为
-    docstring（那会漏掉真正的逻辑变更）。
-
-    替换方式为**原地按坐标覆写**，保留所有原始缩进与换行，
-    确保替换后的文本仍可被 tokenize。
-
-    Args:
-        source: 源码文本。
-
-    Returns:
-        归一化后的源码；无法 tokenize 时原样返回。
-    """
-    try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
-    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        return source
-
-    _SKIP_TYPES = (tokenize.COMMENT, tokenize.NL, tokenize.ENCODING,
-                   tokenize.INDENT, tokenize.DEDENT)
-    at_block_start = True
-    targets: List[Tuple[int, int, int, int]] = []   # (srow, scol, erow, ecol)
-
-    for tok in tokens:
-        if tok.type in _SKIP_TYPES:
-            continue
-        if tok.type == tokenize.NEWLINE:
-            at_block_start = True
-            continue
-        if tok.type == tokenize.ENDMARKER:
-            break
-        if tok.type == tokenize.STRING and at_block_start:
-            targets.append((tok.start[0], tok.start[1],
-                            tok.end[0], tok.end[1]))
-        at_block_start = False
-
-    if not targets:
-        return source
-
-    # 原地覆写：按行拆开，只替换目标字符串占据的字符区间
-    lines = source.splitlines(keepends=True)
-    for srow, scol, erow, ecol in targets:
-        if srow == erow:
-            line = lines[srow - 1]
-            # 保留该行尾部的换行与原有前导空白
-            lines[srow - 1] = (line[:scol] + _DOCSTRING_SENTINEL
-                               + line[ecol:])
-        else:
-            # 跨行字符串：起始行保留前缀 + 哨兵，中间行整行丢弃，
-            # 末行保留最后一个换行符以维持行数基本稳定
-            start_line = lines[srow - 1]
-            end_line = lines[erow - 1]
-            tail = end_line[ecol:]
-            if not tail.endswith("\n") and "\n" in end_line[ecol:]:
-                tail = end_line[ecol:]
-            lines[srow - 1] = start_line[:scol] + _DOCSTRING_SENTINEL + tail
-            for r in range(srow, erow):
-                lines[r] = ""
-    return "".join(lines)
-
-
-def python_token_fingerprint(source: str, normalize_docstrings: bool = True
-                             ) -> Optional[List[str]]:
-    """token 级指纹（AST 失败时的降级方案）。
-
-    丢弃注释/NL/换行/缩进标记，只保留语义 token；启用
-    ``normalize_docstrings`` 时，**额外丢弃 docstring 哨兵 token**，
-    使得"新增 docstring"不会产生任何 token 差异。
-
-    这是对旧版的关键修复：旧版直接比对全部 token，而 docstring 在
-    token 层面就是普通 STRING，导致给含语法错误的代码补注释必然
-    误报 UNSAFE。
-
-    Args:
-        source: 源码文本。
-        normalize_docstrings: 是否把 docstring 视为可忽略内容。
-            关闭则行为与旧版一致（更严格，但会误报）。
-
-    Returns:
-        token 字符串列表；无法 tokenize 时返回 None。
-    """
-    if normalize_docstrings:
-        try:
-            source = _normalize_python_docstrings(source)
-        except Exception:
-            pass          # 归一化失败就退回原文，交由 token 比较兜底
-
-    drop = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
-            tokenize.INDENT, tokenize.DEDENT, tokenize.ENCODING}
-    result: List[str] = []
+def python_token_fingerprint(source: str) -> Optional[List[Tuple[int, str]]]:
+    """保留字符串、缩进、逻辑换行和受保护注释，不猜测 docstring。"""
+    result = []
+    offsets = [0]
+    for line in source.split("\n"):
+        offsets.append(offsets[-1] + len(line) + 1)
     try:
         for tok in tokenize.generate_tokens(io.StringIO(source).readline):
-            if tok.type in drop:
+            if tok.type == tokenize.COMMENT:
+                start = offsets[tok.start[0] - 1] + tok.start[1]
+                protected = _protected_comment(source, start, start + len(tok.string))
+                if protected is not None:
+                    result.append((tok.type, protected))
+            elif tok.type == tokenize.NL and (
+                    not tok.line.strip() or tok.line.lstrip().startswith("#")):
                 continue
-            # 丢弃 docstring 哨兵：新增/修改 docstring 不应产生差异
-            if tok.type == tokenize.STRING and \
-                    tok.string.strip("'\"") == _SENTINEL_BODY:
-                continue
-            result.append("%d:%s" % (tok.type, tok.string))
+            elif tok.type != tokenize.ENCODING:
+                result.append((tok.type, tok.string))
         return result
     except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
         return None
 
 
-# ---------------------------------------------------------------------------
-# 通用语言：剥离注释后比较
-# ---------------------------------------------------------------------------
+class _Unverified(ValueError):
+    pass
 
-def strip_comments_generic(source: str, line_marker: Optional[str],
-                           block_open: Optional[str],
-                           block_close: Optional[str],
-                           nesting: bool = False) -> str:
-    """剥离注释并规范化空白。
 
-    实现为字符串感知的状态机：跟踪单引号/双引号/反引号字符串与
-    转义，避免把字符串里的注释符误当注释剥掉（如 ``url = "http://x"``）。
-    支持块注释嵌套（Rust/Kotlin/Swift），并处理行尾 ``\\`` 续行。
+def _unsupported_at(source: str, i: int, language: str) -> bool:
+    patterns = {
+        "C": r'<[:%]|[:%]>|%:',
+        "C++": r'(?:u8|u|U|L)?R"|<[:%]|[:%]>|%:',
+        "Rust": r'(?:br|cr|r)\#*"',
+        "C#": r'[@$]+"',
+        "Kotlin": r'`',
+        "Scala": r'`',
+        "Dart": r'''[rR]['"]''',
+        "Ruby": r'%|<<|__END__\b',
+        "Perl": r'(?:q[qwrx]?|m|s|tr|y)\b|<<|__(?:END|DATA)__\b',
+        "Shell": r'<<|\$[({]|`',
+        "PowerShell": r'''@['"]|`|\$\(''',
+        "PHP": r'<<<|__halt_compiler\b|\?>|<\?(?!php\b)',
+        "Lua": r'(?:--)?\[=+\[|\[\[',
+        "SQL": r'''\$(?:\w*\$)|[qQ]['"]|#''',
+        "R": r'''[rR]['"]|%''',
+        "Swift": r'#+["/]',
+    }
+    pattern = patterns.get(language)
+    return bool(pattern and re.compile(pattern).match(source, i))
 
-    Args:
-        source: 源码。
-        line_marker: 行注释符；None 表示该语言无行注释。
-        block_open: 块注释起始符；None 表示无块注释。
-        block_close: 块注释结束符。
-        nesting: 块注释是否可嵌套。
 
-    Returns:
-        剥离注释并规范化空白后的文本（用于比较）。
-    """
-    out: List[str] = []
-    in_block = 0
-    in_str: Optional[str] = None
-    in_template = False
-    i, n = 0, len(source)
+def _block_end(source: str, start: int, spec: ls.LangSpec) -> int:
+    opening, closing = spec.block_open, spec.block_close
+    i, depth = start + len(opening), 1
+    while i < len(source):
+        if source.startswith(closing, i):
+            if opening.startswith("="):
+                if (i and source[i - 1] != "\n") or (
+                        i + len(closing) < len(source)
+                        and not source[i + len(closing)].isspace()):
+                    i += 1
+                    continue
+                end = source.find("\n", i)
+                return len(source) if end < 0 else end
+            depth -= 1
+            i += len(closing)
+            if not depth:
+                return i
+        elif source.startswith(opening, i):
+            if spec.nesting:
+                depth += 1
+            elif spec.name in ("SQL", "PowerShell"):
+                raise _Unverified("块注释嵌套依赖语言方言")
+            i += len(opening)
+        else:
+            i += 1
+    raise _Unverified("块注释未闭合")
 
-    while i < n:
+
+def _string_end(source: str, start: int, language: str) -> int:
+    quote = source[start]
+    if source.startswith(quote * 3, start):
+        raise _Unverified("不支持三引号/raw 字符串")
+    if quote == "'" and language in ("Rust", "Scala") and (
+            start + 2 >= len(source) or (
+                source[start + 1] != "\\" and source[start + 2] != "'")):
+        raise _Unverified("无法排除生命周期/符号字面量")
+    if quote == "`" and language not in ("JavaScript", "TypeScript", "Go", "SQL"):
+        raise _Unverified("不支持此反引号构造")
+    raw = quote == "`" and language in ("Go", "SQL")
+    single_raw = quote == "'" and language in ("Shell", "PowerShell", "SQL")
+    i = start + 1
+    while i < len(source):
         ch = source[i]
-
-        if in_block:
-            if block_close and source.startswith(block_close, i):
-                in_block -= 1
-                i += len(block_close)
-            elif nesting and block_open and source.startswith(block_open, i):
-                in_block += 1
-                i += len(block_open)
-            else:
-                i += 1
-            continue
-
-        if in_str:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(source[i + 1])
+        if ch == quote:
+            if language in ("SQL", "PowerShell") and source.startswith(quote * 2, i):
                 i += 2
                 continue
-            if ch == in_str:
-                in_str = None
-                if not in_template:
-                    pass
-            i += 1
-            continue
-
-        if ch in ("'", '"', "`"):
-            in_str = ch
-            in_template = ch == "`"
-            out.append(ch)
-            i += 1
-            continue
-
-        if block_open and source.startswith(block_open, i):
-            in_block = 1
-            i += len(block_open)
-            continue
-
-        if line_marker and source.startswith(line_marker, i):
-            while i < n and source[i] != "\n":
-                i += 1
-            continue
-
-        out.append(ch)
+            return i + 1
+        if ((language in ("JavaScript", "TypeScript") and quote == "`"
+             and source.startswith("${", i))
+                or (language in ("Ruby", "Perl") and quote == '"'
+                    and ch in ("#", "$", "@"))
+                or (language in ("Shell", "PowerShell", "PHP", "Kotlin", "Scala", "Dart")
+                    and quote != "'" and ch in ("$", "`"))
+                or (language == "Swift" and source.startswith("\\(", i))):
+            raise _Unverified("不支持字符串内插/命令替换")
+        if ch in "\r\n" and quote != "`":
+            raise _Unverified("不支持此多行字符串或字符串未闭合")
+        if ch == "\\" and not raw:
+            if language == "SQL":
+                raise _Unverified("SQL 字符串转义依赖方言")
+            if not single_raw:
+                i += 2
+                continue
+        if ch == "`" and language == "PowerShell" and quote == '"':
+            raise _Unverified("不支持 PowerShell 转义字符串")
         i += 1
-
-    # 规范化：去掉行尾空白与空行，压缩行内连续空白
-    lines = []
-    for line in "".join(out).splitlines():
-        normalized = re.sub(r"\s+", " ", line).strip()
-        if normalized:
-            lines.append(normalized)
-    return "\n".join(lines)
+    raise _Unverified("字符串未闭合")
 
 
-# ---------------------------------------------------------------------------
-# 主比较逻辑
-# ---------------------------------------------------------------------------
+def generic_fingerprint(source: str, language: str) -> List[str]:
+    """有限词法比较；不支持或未闭合的构造拒绝验证。"""
+    spec = spec_for(language)
+    if spec.name == "Unknown":
+        raise _Unverified("未知语言")
+    if "\x00" in source or "\u2028" in source or "\u2029" in source:
+        raise _Unverified("不支持的控制字符/行分隔符")
+    if language in ("C", "C++") and re.search(r"\\\r?\n|\?\?/", source):
+        raise _Unverified("不支持预处理续行/trigraph")
+    if language == "Java" and "\\u" in source:
+        raise _Unverified("不支持词法分析前的 Java Unicode 转义")
+    if language == "PHP" and not source.startswith("<?php"):
+        raise _Unverified("无法确认 PHP 代码区边界")
+
+    out: List[str] = []
+    gap = False
+    previous_kind = ""
+    previous_text = ""
+    preprocessor = False
+    keep_spaces = language in (
+        "Ruby", "Shell", "Perl", "PowerShell", "Swift", "Rust", "R",
+        "Kotlin", "Scala", "C#", "SQL",
+    )
+
+    def emit(kind: str, text: str) -> None:
+        nonlocal gap, previous_kind, previous_text
+        if out and out[-1] != "newline" and gap and (
+                keep_spaces or preprocessor
+                or (kind == "literal" and previous_kind in ("word", "literal"))
+                or (kind == "word" and previous_kind == "literal")):
+            out.append("space")
+        out.append(kind + ":" + repr(text))
+        gap = False
+        previous_kind = kind
+        previous_text = text
+
+    def newline() -> None:
+        nonlocal gap, previous_kind, preprocessor
+        if out and out[-1] != "newline":
+            out.append("newline")
+        gap = False
+        previous_kind = ""
+        preprocessor = False
+
+    i, n = 0, len(source)
+    while i < n:
+        ch = source[i]
+        if ch in "\r\n":
+            newline()
+            i += 2 if source.startswith("\r\n", i) else 1
+            continue
+        if ch in " \t":
+            gap = True
+            i += 1
+            continue
+        if ch.isspace() or ch == "\\":
+            raise _Unverified("不支持的空白/字符串外转义")
+        if _unsupported_at(source, i, language):
+            raise _Unverified("不支持的 raw/heredoc/引用构造")
+
+        block = bool(spec.block_open and source.startswith(spec.block_open, i))
+        if block and spec.block_open.startswith("="):
+            end = i + len(spec.block_open)
+            block = (i == 0 or source[i - 1] == "\n") and (
+                end == n or source[end].isspace())
+        line = bool(spec.line and source.startswith(spec.line, i))
+        if language == "SQL" and line and i + 2 < n and not source[i + 2].isspace():
+            raise _Unverified("SQL 行注释边界依赖方言")
+        if language == "Shell" and line:
+            line = i == 0 or source[i - 1].isspace() or source[i - 1] in ";|&()<>"
+        if language == "PHP" and ch == "#":
+            if source.startswith("#[", i):
+                raise _Unverified("不支持 PHP 属性构造")
+            line = True
+        if i == 0 and source.startswith("#!"):
+            line = True
+        if block or line:
+            line_end = _LINE_END.search(source, i)
+            end = _block_end(source, i, spec) if block else (
+                line_end.start() if line_end else n)
+            comment = source[i:end]
+            if language == "PHP" and "?>" in comment:
+                raise _Unverified("不支持注释内 PHP 关闭标签")
+            protected = _protected_comment(source, i, end)
+            if protected is not None:
+                emit("directive", protected)
+            gap = True
+            if "\n" in comment or "\r" in comment:
+                was_preprocessor = preprocessor
+                newline()
+                preprocessor = was_preprocessor
+            i = end
+            continue
+        if ch in ("'", '"', "`"):
+            end = _string_end(source, i, language)
+            literal = source[i:end]
+            if language == "Go" and re.fullmatch(
+                    r'"(?:C|\\(?:x43|u0043|U00000043|103))"|`C`',
+                    literal.replace("\r", "")):
+                raise _Unverified("无法排除 cgo 前导注释")
+            emit("literal", literal)
+            i = end
+            continue
+        if ch == "/" and language in ("Ruby", "Perl", "Swift"):
+            raise _Unverified("无法排除正则字面量")
+        if language in ("JavaScript", "TypeScript") and ch in ("/", "<"):
+            expression_start = {
+                "return", "throw", "yield", "await", "case", "delete", "typeof",
+                "void", "new", "in", "of", "instanceof", "else", "do", "extends",
+                "default", "export", "import", "function", "class", "const", "let", "var",
+            }
+            if previous_kind not in ("word", "literal") or previous_text in expression_start:
+                raise _Unverified("无法排除正则字面量或 JSX/TSX")
+        if preprocessor and ch == "<":
+            raise _Unverified("不支持预处理中的尖括号构造")
+        if language == "Perl" and ch == "=" and (i == 0 or source[i - 1] == "\n"):
+            raise _Unverified("不支持此 POD 指令")
+        match = _WORD.match(source, i)
+        if match:
+            emit("word", match.group())
+            i = match.end()
+        else:
+            if ch == "#" and language in ("C", "C++"):
+                preprocessor = True
+            match = _OPERATOR.match(source, i)
+            if not match:
+                raise _Unverified("无法识别的词法符号")
+            emit("operator", match.group())
+            i = match.end()
+
+    if out and out[-1] == "newline":
+        out.pop()
+    return out
+
 
 def _first_diff(old: str, new: str, label: str) -> str:
-    """定位首个差异行，供 --verbose 输出。"""
-    old_lines = old.splitlines()
-    new_lines = new.splitlines()
+    """定位首个差异行。"""
+    old_lines, new_lines = old.splitlines(), new.splitlines()
     for idx, (a, b) in enumerate(zip(old_lines, new_lines)):
         if a != b:
-            return ("%s首个差异（规范化后第 %d 行）:\n  原: %s\n  新: %s"
-                    % (label, idx + 1, a[:160], b[:160]))
-    return ("%s行数不一致：%d -> %d（存在非注释内容增删）"
-            % (label, len(old_lines), len(new_lines)))
+            return "%s首个差异（第 %d 行）:\n  原: %s\n  新: %s" % (
+                label, idx + 1, a[:160], b[:160])
+    return "%s行数不一致：%d -> %d" % (label, len(old_lines), len(new_lines))
 
 
-def resolve_language(path_or_ext: str, modified: str,
-                     original: str = "") -> str:
-    """把"路径或扩展名"统一解析为语言名。
-
-    支持三种入参形式，便于 API 调用与 CLI 复用：
-        - 完整路径（``"src/app.js.commenter.bak"``）→ 走语言探测；
-        - 纯扩展名（``".py"``）→ 拼接为伪文件名后探测；
-        - 语言名（``"Python"``）→ 直接返回。
-    """
-    if path_or_ext in ls.LANG_SPECS:
+def resolve_language(path_or_ext: str, modified: str, original: str = "") -> str:
+    """解析语言名、扩展名或路径；校验时不根据代码片段猜测语言。"""
+    if path_or_ext in ls.LANG_SPECS or path_or_ext == "Unknown":
         return path_or_ext
-    if path_or_ext.startswith(".") and os.path.sep not in path_or_ext:
-        return detect_language("x" + path_or_ext, modified)
-    lang = detect_language(path_or_ext, modified)
-    if lang == "Unknown" and original:
-        lang = detect_language(path_or_ext, original)
-    return lang
+    path = "x" + path_or_ext if path_or_ext.startswith(".") else path_or_ext
+    if os.path.basename(path).lower().startswith(("makefile", "dockerfile", "jenkinsfile")):
+        return "Unknown"
+    return detect_language(path)
 
 
 def compare(original: str, modified: str, path_or_ext: str,
             verbose: bool) -> Tuple[str, str]:
-    """比较两个版本，返回 ``(判定结果, 说明)``。
-
-    判定结果为 ``SAFE`` 或 ``UNSAFE``。语言通过 :func:`resolve_language`
-    推断，因此 ``app.js.commenter.bak`` 这类备份文件名也能正确识别
-    （旧版直接取扩展名，``.bak`` 取不到语法会退化成 ``#`` 注释，
-    导致 JS/Java 等语言的注释剥离完全失效，且 JSDoc 无法被剥离，
-    使每次合法操作都误报 UNSAFE）。
-
-    Args:
-        original: 原始（加注释前）源码。
-        modified: 修改后源码。
-        path_or_ext: 文件路径、扩展名或语言名，用于语言判定。
-        verbose: 是否在 UNSAFE 时输出首个差异位置。
-    """
+    """返回 SAFE、UNSAFE 或 UNVERIFIED 及说明，不保证运行行为等价。"""
     language = resolve_language(path_or_ext, modified, original)
-
     if language == "Python":
-        fp_old = python_fingerprint(original)
-        fp_new = python_fingerprint(modified)
-        if fp_old is not None and fp_new is not None:
-            if fp_old == fp_new:
-                return "SAFE", "Python AST 一致（docstring 已剥离后比较）"
-            if verbose:
-                return "UNSAFE", _ast_diff_hint(original, modified)
-            return "UNSAFE", "Python AST 不一致：修改涉及可执行代码"
-
-        # AST 不可用（存在语法错误）→ docstring 归一化后的 token 比较
-        tk_old = python_token_fingerprint(original, normalize_docstrings=True)
-        tk_new = python_token_fingerprint(modified, normalize_docstrings=True)
+        fp_old, fp_new = python_fingerprint(original), python_fingerprint(modified)
+        if fp_old is not None and fp_new is None:
+            return "UNSAFE", "原 Python 有效，修改后无法编译"
+        tk_old = python_token_fingerprint(original)
+        tk_new = python_token_fingerprint(modified)
         if tk_old is not None and tk_new is not None:
-            if tk_old == tk_new:
-                return "SAFE", ("token 序列一致（AST 不可用，已降级；"
-                                "docstring 已归一化后比较）")
+            directives_old = [v for t, v in tk_old if t == tokenize.COMMENT]
+            directives_new = [v for t, v in tk_new if t == tokenize.COMMENT]
+            if directives_old != directives_new:
+                return "UNSAFE", "受保护的指令/编码注释或其位置发生变化"
+        if fp_old is not None and fp_new is not None:
+            if tk_old is None or tk_new is None:
+                return "UNVERIFIED", "无法验证 Python 指令注释"
+            if fp_old == fp_new:
+                return "SAFE", "Python AST 一致（仅剥离真正 docstring，指令注释已核对）"
+            detail = "Python AST 不一致"
             if verbose:
-                return "UNSAFE", _token_diff_hint(
-                    tk_old, tk_new,
-                    "（语法错误文件，docstring 已归一化）")
-            return "UNSAFE", ("token 序列不一致（语法错误文件降级比较），"
-                              "修改涉及非注释内容")
+                detail += "\n" + _first_diff(original, modified, "源码 ")
+            return "UNSAFE", detail
+        if tk_old is not None and tk_new is not None and tk_old != tk_new:
+            uncertain = {tokenize.STRING, tokenize.NEWLINE, tokenize.NL,
+                         tokenize.INDENT, tokenize.DEDENT}
+            certain_old = [v for v in tk_old if v[0] not in uncertain]
+            certain_new = [v for v in tk_new if v[0] not in uncertain]
+            strings_old = [v for t, v in tk_old if t == tokenize.STRING]
+            strings_new = [v for t, v in tk_new if t == tokenize.STRING]
+            if certain_old != certain_new or strings_old == strings_new:
+                detail = "Python AST 不可用，但检测到明确的 token/缩进/换行变化"
+                if verbose:
+                    detail += "\n" + _first_diff(original, modified, "源码 ")
+                return "UNSAFE", detail
+        return "UNVERIFIED", "原 Python 无效；token 比较不能确认 docstring 或源码等价"
 
-        # token 也不可用 → 走通用语言剥注释比较
-        language = "Unknown"
-
-    spec = spec_for(language)
-    nesting = bool(getattr(spec, "nesting", False))
-    stripped_old = strip_comments_generic(
-        original, spec.line, spec.block_open, spec.block_close, nesting)
-    stripped_new = strip_comments_generic(
-        modified, spec.line, spec.block_open, spec.block_close, nesting)
-
-    if stripped_old == stripped_new:
-        return "SAFE", "剥离注释并规范化空白后内容一致"
-
-    lang_note = "（语言：%s）" % spec.name if spec.name != "Unknown" \
-        else "（未能识别语言，按 # 行注释处理，结果仅供参考）"
+    try:
+        old = generic_fingerprint(original, language)
+        new = generic_fingerprint(modified, language)
+    except _Unverified as exc:
+        return "UNVERIFIED", "%s：%s" % (language, exc)
+    if old == new:
+        return "SAFE", "%s：支持范围内的词法内容与指令注释一致" % language
+    detail = "%s：源码词法内容、换行或受保护注释发生变化" % language
     if verbose:
-        return "UNSAFE", _first_diff(stripped_old, stripped_new, lang_note + " ")
-    return "UNSAFE", "剥离注释后内容不一致：修改涉及非注释内容" + lang_note
+        detail += "\n" + _first_diff("\n".join(old), "\n".join(new), "词法项 ")
+    return "UNSAFE", detail
 
-
-def _ast_diff_hint(original: str, modified: str) -> str:
-    """AST 不一致时，给出最具可读性的定位提示。
-
-    用"剥离 docstring 后的源码"逐行比较来近似定位，便于用户找到
-    被误改的代码行。
-    """
-    def _strip_text(src: str) -> str:
-        try:
-            tree = ast.parse(src)
-        except Exception:
-            return src
-        stripped = _DocstringStripper().visit(tree)
-        try:
-            return ast.unparse(stripped)
-        except Exception:
-            return src
-
-    diff = _first_diff(_strip_text(original), _strip_text(modified), "")
-    return "Python AST 不一致，修改涉及可执行代码。\n  " + diff
-
-
-def _token_diff_hint(old: List[str], new: List[str], note: str) -> str:
-    """token 序列差异定位。"""
-    for idx, (a, b) in enumerate(zip(old, new)):
-        if a != b:
-            return "token 序列不一致%s：第 %d 个 token\n  原: %s\n  新: %s" \
-                % (note, idx + 1, a[:120], b[:120])
-    return "token 数量不一致%s：%d -> %d" % (note, len(old), len(new))
-
-
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="校验两个版本的源码文件是否仅注释不同",
+        description="在支持的范围内比较源码是否仅普通注释/docstring 不同",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="退出码：0 SAFE / 1 UNSAFE / 2 输入错误",
+        epilog="退出码：0 SAFE / 1 UNSAFE / 2 输入错误 / 3 UNVERIFIED（未验证）",
     )
     parser.add_argument("original", help="原始文件（加注释前的备份）")
     parser.add_argument("modified", help="修改后文件（已加注释）")
-    parser.add_argument("--verbose", action="store_true",
-                        help="UNSAFE 时输出首个差异位置")
-    parser.add_argument("--quiet", action="store_true",
-                        help="只输出 SAFE / UNSAFE，适合脚本消费")
+    parser.add_argument("--verbose", action="store_true", help="UNSAFE 时输出首个差异位置")
+    parser.add_argument("--quiet", action="store_true", help="只输出 SAFE / UNSAFE / UNVERIFIED")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-
-    for p in (args.original, args.modified):
-        if not os.path.isfile(p):
-            print("ERROR: 文件不存在 -> %s" % p, file=sys.stderr)
+    for path in (args.original, args.modified):
+        if not os.path.isfile(path):
+            print("ERROR: 文件不存在 -> %s" % path, file=sys.stderr)
             return 2
-
-    src_old = read_text(args.original)
-    src_new = read_text(args.modified)
+    src_old, src_new = read_text(args.original), read_text(args.modified)
     if src_old is None or src_new is None:
         print("ERROR: 文件无法读取（二进制/超大/编码不可识别）", file=sys.stderr)
         return 2
-
-    # 用"修改后文件"的路径探测语言；若探测失败再试原始文件
-    language = detect_language(args.modified, src_new)
+    language = resolve_language(args.modified, src_new, src_old)
     if language == "Unknown":
-        language = detect_language(args.original, src_old)
-
-    # compare 接受路径，但这里已探测好语言，直接按语言分发
-    if language == "Python":
-        verdict, detail = compare(src_old, src_new, ".py", args.verbose)
-    else:
-        verdict, detail = compare(src_old, src_new,
-                                 args.modified, args.verbose)
-
+        language = resolve_language(args.original, src_new, src_old)
+    verdict, detail = compare(src_old, src_new, language, args.verbose)
     text = verdict if args.quiet else "%s\n%s" % (verdict, detail)
     try:
         print(text)
     except UnicodeEncodeError:
         sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
-    return 0 if verdict == "SAFE" else 1
+    return {"SAFE": 0, "UNSAFE": 1, "UNVERIFIED": 3}[verdict]
 
 
 if __name__ == "__main__":

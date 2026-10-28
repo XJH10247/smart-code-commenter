@@ -7,13 +7,12 @@ from decimal import Decimal, ROUND_HALF_UP
 def calc_final_price(items, coupon=None, vip_level=0):
     """计算订单最终应付金额（优惠券与 VIP 折扣可叠加）。
 
-    计算顺序固定为：合计原价 → 优惠券折扣 → VIP 折扣，
-    顺序不同会导致金额差异，调整时需与计费侧口径对齐。
+    按代码顺序合计原价、应用优惠券和 VIP 折扣，最后保留两位小数。
 
     Args:
         items: 商品明细列表，每项为含 "price"（单价）与 "qty"（数量）的 dict。
-        coupon: 优惠券码，格式为 SAVE + 两位折扣数字（如 SAVE15 表示 85 折）；
-            为 None 或格式不符时不参与计算，不报错。
+        coupon: 字符串优惠券码，格式为 SAVE + 两位折扣数字（如 SAVE15 表示 85 折）；
+            为 None 或字符串格式不匹配时不参与计算。
         vip_level: 用户 VIP 等级，3 级及以上在券后价基础上再享 95 折。
 
     Returns:
@@ -31,7 +30,7 @@ def calc_final_price(items, coupon=None, vip_level=0):
         total *= (Decimal(100 - off) / 100)
     if vip_level >= 3:
         total *= Decimal("0.95")
-    # ROUND_HALF_UP 与财务侧"四舍五入"口径一致，勿改为默认的银行家舍入
+    # 显式指定 ROUND_HALF_UP，避免依赖 Decimal 上下文的默认舍入模式
     return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 ```
 

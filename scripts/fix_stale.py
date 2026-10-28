@@ -1,540 +1,563 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""过期注释修复器（smart-code-commenter 配套工具）。
-
-检测代码与文档注释不一致的情况，生成修正建议；默认 **dry-run**，
-只有显式传入 ``--apply`` 才会写入文件。
-
-本工具严格限定在"只改注释"的边界内：
-    - 绝不修改任何可执行代码、字符串字面量、导入语句；
-    - 每次写入前自动备份，写入后可选调用 safety_check 复验；
-    - 无法确定修正方式时只报告，不猜测。
-
-支持的修正类型：
-    1. ``param-extra``  文档中记载了签名里不存在的参数 → 删除该条目；
-    2. ``param-missing`` 签名中的参数未在文档中出现 → 生成待补条目（占位，
-       需人工填写，默认不自动写入，除非 ``--fill-placeholder``）；
-    3. ``todo-stale``   超期未处理的 TODO/FIXME（按 ``--todo-days``
-       无法判定日期，因此仅按行统计并提示，不自动改动）。
-
-用法：
-    python fix_stale.py <路径> [--apply] [--format text|json] [--verbose]
-
-退出码：
-    0  无待修复项（或已成功应用）
-    1  发现了待修复项但未应用（dry-run 模式下的"有差异"信号）
-    2  输入错误
-    3  应用后自检失败（已自动回滚）
-"""
+"""默认 dry-run；仅删除可精确定位的多余参数条目，候选校验后逐文件提交。"""
 
 from __future__ import annotations
 
 import argparse
 import ast
 import difflib
+import fnmatch
+import io
 import json
 import os
 import re
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field, asdict
+import tokenize
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from langspec import SKIP_DIRS, detect_language  # noqa: E402
-import comment_scanner as cs                      # noqa: E402
-
-# 各语言的文档注释参数记号（用于定位待修正的参数条目）
-_GOOGLE_ARG_RE = re.compile(
-    r"^(?P<indent>\s+)(?P<name>\*{0,2}\w+)(?P<rest>\s*(?:\([^)]*\))?\s*:\s*)(?P<desc>.*)$"
-)
-_NUMPY_ARG_RE = re.compile(
-    r"^(?P<indent>\s+)(?P<name>\w+)(?P<rest>\s*:\s*[\w\[\], |]+)(?P<desc>\s*)$"
-)
-_TAG_ARG_RE = re.compile(
-    r"^(?P<indent>\s*\*?\s*@param(?:\[[^\]]*\])?\s+)(?P<name>\w+)(?P<rest>.*)$"
-)
-# NumPy 风格章节下的分隔下划线，如 ``----------`` / ``======``
-_UNDERLINE_RE = re.compile(r"^[-=~^#*+]{3,}$")
+from langspec import MAX_FILE_BYTES, SKIP_DIRS, detect_language  # noqa: E402
+import comment_scanner as cs  # noqa: E402
 
 
-def _has_underline(lines: List[str], header_idx: int, header_indent: int) -> bool:
-    """判断 ``lines[header_idx]`` 之后是否紧跟一行同缩进的分隔下划线。
+class AnalysisError(Exception):
+    pass
 
-    这是区分 NumPy 风格（``Parameters`` + ``----------``）与 Google 风格
-    （``Args:``）的可靠依据 —— 后者不存在下划线。
-    """
-    j = header_idx + 1
-    while j < len(lines) and not lines[j].strip():
-        j += 1
-    if j >= len(lines):
-        return False
-    cand = lines[j]
-    if len(cand) - len(cand.lstrip()) != header_indent:
-        return False
-    return bool(_UNDERLINE_RE.match(cand.strip()))
 
+@dataclass(frozen=True)
+class Snapshot:
+    raw: bytes
+    source: str
+    encoding: str
+    identity: tuple
+    mode: int
 
 
 @dataclass
 class Finding:
-    """一条待修正的过期注释记录。"""
     path: str
     line: int
-    kind: str                    # param-extra / param-missing / todo
+    kind: str
     symbol: str
     detail: str
     fixable: bool = False
     old_text: str = ""
     new_text: str = ""
+    end_line: int = 0
+    applied: bool = False
+    _snapshot: Optional[Snapshot] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {k: v for k, v in vars(self).items() if not k.startswith("_")}
 
 
-# ---------------------------------------------------------------------------
-# 检测
-# ---------------------------------------------------------------------------
+@dataclass
+class FileResult:
+    path: str
+    findings: List[Finding] = field(default_factory=list)
+    status: str = "clean"
+    error: str = ""
+    backup: str = ""
+    retained_files: List[str] = field(default_factory=list)
 
-def analyze_python_file(path: str) -> List[Finding]:
-    """分析单个 Python 文件，返回过期注释发现列表。"""
-    findings: List[Finding] = []
+    def to_dict(self) -> dict:
+        return {
+            "path": self.path, "status": self.status, "error": self.error,
+            "applied_findings": sum(f.applied for f in self.findings),
+            "pending_findings": sum(not f.applied for f in self.findings),
+            "backup": self.backup, "retained_files": self.retained_files,
+        }
+
+
+def _identity(info) -> tuple:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode)
+
+
+def _read_snapshot(path: str) -> Snapshot:
     try:
-        with open(path, "rb") as f:
-            raw = f.read()
-        source = raw.decode("utf-8-sig")
-    except (OSError, UnicodeDecodeError):
-        return findings
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise AnalysisError("不是普通文件（不自动修改符号链接）")
+        with open(path, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read(MAX_FILE_BYTES + 1)
+            after = os.fstat(stream.fileno())
+        if len(raw) > MAX_FILE_BYTES:
+            raise AnalysisError("文件超过 MAX_FILE_BYTES 限制")
+        if not (_identity(info) == _identity(before) == _identity(after)
+                == _identity(os.lstat(path))):
+            raise AnalysisError("读取期间文件发生变化")
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+        source = raw.decode(encoding)
+        if source.encode(encoding) != raw:
+            raise AnalysisError("编码不能无损往返")
+        return Snapshot(raw, source, encoding, _identity(info),
+                        stat.S_IMODE(info.st_mode))
+    except (OSError, UnicodeError, SyntaxError, LookupError) as exc:
+        raise AnalysisError("读取失败: %s" % exc) from exc
 
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return findings          # 语法错误文件不做修正建议
 
-    lines = source.splitlines()
-
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        doc = ast.get_docstring(node)
-        if doc is None:
-            continue
-
-        real_args = _real_arg_names(node)
-        doc_args = _documented_arg_names(doc)
-
-        # 类型 1：文档里有、签名里没有 → 可安全删除
-        for name, lineno_in_doc in doc_args.items():
-            if name in real_args:
-                continue
-            abs_line = (node.lineno + 1) + (lineno_in_doc - 1)
-            old_text = lines[abs_line - 1] if 0 < abs_line <= len(lines) else ""
-            findings.append(Finding(
-                path=path, line=abs_line, kind="param-extra",
-                symbol=node.name,
-                detail="docstring 记载的参数 %r 不在函数签名中" % name,
-                fixable=bool(old_text.strip()),
-                old_text=old_text,
-                new_text="",
-            ))
-
-        # 类型 2：签名里有、文档里没提 → 只报告（补写内容需语义判断）
-        missing = sorted(real_args - set(doc_args) - {"self", "cls"})
-        if missing and doc_args:
-            findings.append(Finding(
-                path=path, line=node.lineno, kind="param-missing",
-                symbol=node.name,
-                detail="参数 %s 未在 docstring 中说明"
-                       % ", ".join(repr(m) for m in missing),
-                fixable=False,
-            ))
-
-    return findings
+def _lines(source: str) -> List[str]:
+    return io.StringIO(source, newline="").readlines()
 
 
 def _real_arg_names(node) -> set:
-    """提取函数签名的参数名集合（含 self/cls）。"""
     names = {a.arg for a in getattr(node.args, "posonlyargs", [])}
-    names |= {a.arg for a in node.args.args}
-    names |= {a.arg for a in node.args.kwonlyargs}
+    names.update(a.arg for a in node.args.args)
+    names.update(a.arg for a in node.args.kwonlyargs)
     if node.args.vararg:
         names.add(node.args.vararg.arg)
     if node.args.kwarg:
         names.add(node.args.kwarg.arg)
-    names |= {"self", "cls"}
     return names
 
 
-_DOC_SECTION_WORDS = {
-    "returns", "raises", "args", "arguments", "yields", "note", "notes",
-    "example", "examples", "attributes", "parameters", "other", "see",
-    "seealso", "references", "warns", "warning", "todo", "keyword",
-    "kwargs", "return", "raise", "yield",
-}
+def _doc_token(value, tokens, source_lines):
+    """只接受独占起止行、与 AST 原文逐字符一致的单个三引号 token。"""
+    token = tokens.get((value.lineno, value.col_offset))
+    if token is None:
+        return None
+    a, b = token.start, token.end
+    b_byte = (b[0], len(source_lines[b[0] - 1][:b[1]].encode("utf-8")))
+    if b_byte != (value.end_lineno, value.end_col_offset):
+        return None
+    match = re.match(r"(?i)^(?:r|u)?(\"\"\"|''')", token.string)
+    if not match or not token.string.endswith(match.group(1)):
+        return None
+    body = token.string[match.end():-3]
+    if ("\\" in body or body != value.value
+            or any(c in body for c in "\v\f\x1c\x1d\x1e\x85\u2028\u2029")):
+        return None
+    if (source_lines[a[0] - 1][:a[1]].strip()
+            or source_lines[b[0] - 1][b[1]:].strip()):
+        return None
+    return token
 
 
-def _documented_arg_names(doc: str) -> dict:
-    """从 docstring 中提取"文档声明的参数名" → docstring 内行号映射。
-
-    同时支持 Google 风格（``Args:`` + ``name:``）与 NumPy 风格
-    （``Parameters`` + ``name : type``），并跳过章节标题词。
-
-    章节判定依据**缩进层级**：``Args:`` 这类章节标题是当前缩进层，
-    其后的参数条目缩进更深。这样可正确处理 ``Returns:`` 之后结束、
-    以及 ``Note:`` 等非参数小节穿插的情况。
-    """
-    result = {}
-    lines = doc.splitlines()
-    section_indent: Optional[int] = None      # 参数条目所需的最小缩进
-    numpy_underline = False                   # 该章节是否为 NumPy 下划线式
-    _SECTION_NAMES = {
-        "args", "arguments", "parameters", "keyword args", "keyword arguments",
-        "other parameters",
-    }
-    _NON_SECTION = {
-        "returns", "return", "raises", "raise", "yields", "yield",
-        "note", "notes", "example", "examples", "attributes", "see also",
-        "references", "warns", "warning", "todo",
-    }
-
-    for idx, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        indent = len(line) - len(line.lstrip())
-
-        # NumPy 风格的分隔下划线（``----------``）：跳过，且其存在本身
-        # 已在上面的章节标题处理中把条目缩进层级下调了一级。
-        if numpy_underline and _UNDERLINE_RE.match(stripped):
-            continue
-
-        # 章节标题：形如 `Args:` / `Parameters` / `Returns:`（无额外描述）
-        head = re.match(r"^([A-Za-z][A-Za-z ]*?)\s*:?\s*$", stripped)
-        if head:
-            name = head.group(1).strip().lower()
-            if name in _SECTION_NAMES:
-                # NumPy 风格的条目与标题**同缩进**，靠下一行的 `-----`
-                # 与标题区分；Google 风格则是严格更深一级。
-                numpy_underline = _has_underline(lines, idx, indent)
-                section_indent = indent - 1 if numpy_underline else indent
+def _analyze(path: str, snapshot: Snapshot) -> List[Finding]:
+    source = snapshot.source.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        tree = ast.parse(source, filename=path)
+        compile(tree, path, "exec")
+        source_lines = source.split("\n")
+        tokens = {}
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.STRING:
+                row, col = token.start
+                tokens[(row, len(source_lines[row - 1][:col].encode("utf-8")))] = token
+        original_lines = _lines(snapshot.source)
+        findings = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if name in _NON_SECTION:
-                section_indent = None
-                numpy_underline = False
+            if not node.body or not isinstance(node.body[0], ast.Expr):
                 continue
+            value = node.body[0].value
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                continue
+            entries, has_section = cs.parse_doc_parameters(value.value)
+            real_args = _real_arg_names(node)
+            documented = {name for entry in entries for name in entry.names}
+            token = _doc_token(value, tokens, source_lines)
+            for entry in entries:
+                extras = sorted(set(entry.names) - real_args)
+                if not extras:
+                    continue
+                line = value.lineno
+                end_line = line
+                old_text = ""
+                reason = "源码与 docstring 行映射不确定（转义、拼接或同行内容）"
+                fixable = False
+                if token:
+                    line = token.start[0] + entry.start_line - 1
+                    end_line = token.start[0] + entry.end_line - 1
+                    if not (1 <= entry.start_line <= entry.end_line
+                            <= len(value.value.splitlines())):
+                        raise AnalysisError("参数解析器返回了无效行范围")
+                    # 章节末的空白不属于说明，不删除承载结束引号的行。
+                    doc_lines = value.value.splitlines()
+                    while (end_line >= line
+                           and not doc_lines[end_line - token.start[0]].strip()):
+                        end_line -= 1
+                    if token.start[0] < line <= end_line < token.end[0]:
+                        old_text = "".join(original_lines[line - 1:end_line])
+                        fixable = True
+                    else:
+                        reason = "参数范围与 docstring 引号所在行重叠"
+                if set(entry.names) & real_args:
+                    fixable = False
+                    reason = "组合参数条目仍包含有效参数，需人工拆分"
+                detail = "docstring 记载的参数 %s 不在函数签名中" % ", ".join(
+                    repr(name) for name in extras)
+                if not fixable:
+                    detail += "；不可自动修复：" + reason
+                findings.append(Finding(
+                    path, line, "param-extra", node.name, detail, fixable,
+                    old_text, "", end_line, _snapshot=snapshot))
+            missing = sorted(real_args - documented - {"self", "cls"})
+            if missing and has_section:
+                findings.append(Finding(
+                    path, node.lineno, "param-missing", node.name,
+                    "参数 %s 未在 docstring 中说明" % ", ".join(map(repr, missing)),
+                    _snapshot=snapshot))
+        return findings
+    except AnalysisError:
+        raise
+    except Exception as exc:
+        raise AnalysisError("分析失败: %s: %s" % (type(exc).__name__, exc)) from exc
 
-        if section_indent is None or indent <= section_indent:
-            continue
 
-        m = _GOOGLE_ARG_RE.match(line)
-        if m:
-            arg = m.group("name").lstrip("*")
-            if arg.lower() not in _DOC_SECTION_WORDS:
-                result[arg] = idx + 1
-            continue
-        m = _NUMPY_ARG_RE.match(line)
-        if m:
-            arg = m.group("name")
-            if (arg.lower() not in _DOC_SECTION_WORDS
-                    and not arg.startswith("-")):
-                result[arg] = idx + 1
-
-    return result
+def analyze_python_file(path: str) -> List[Finding]:
+    path = os.path.abspath(path)
+    return _analyze(path, _read_snapshot(path))
 
 
 def analyze_todos(path: str) -> List[Finding]:
-    """收集 TODO/FIXME 积压（仅报告，不自动改动）。"""
-    findings: List[Finding] = []
+    path = os.path.abspath(path)
+    snapshot = _read_snapshot(path)
+    if not snapshot.source.strip():
+        return []
     try:
-        rep = cs.scan_file(path, skip_tests=False)
-    except Exception:
-        return findings
-    if rep.skipped:
-        return findings
-    for item in rep.todos:
-        findings.append(Finding(
-            path=path, line=0, kind="todo",
-            symbol="-", detail=item, fixable=False,
-        ))
-    return findings
+        report = cs.scan_file(path, skip_tests=False)
+        if report.skipped or not getattr(report, "complete", True):
+            raise AnalysisError(report.skip_reason or "TODO 分析不完整")
+        return [Finding(path, 0, "todo", "-", item) for item in report.todos]
+    except Exception as exc:
+        raise AnalysisError("TODO 分析失败: %s" % exc) from exc
+
+
+def _collect(target: str, include_todos: bool, max_files: int,
+             exclude: Optional[List[str]] = None) -> List[FileResult]:
+    if not isinstance(max_files, int) or max_files <= 0:
+        raise ValueError("--max-files 必须大于 0")
+    target = os.path.abspath(target)
+    if not (os.path.isfile(target) or os.path.isdir(target)):
+        raise ValueError("路径不是可扫描的文件或目录: " + target)
+    root = os.path.dirname(target) if os.path.isfile(target) else target
+    reports = []
+    paths = []
+
+    def excluded(path, directory=False):
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        return any(fnmatch.fnmatchcase(relative, pattern)
+                   or (directory and fnmatch.fnmatchcase(relative + "/", pattern))
+                   for pattern in (exclude or []))
+
+    def eligible(path):
+        return detect_language(path) == "Python" and not excluded(path)
+
+    def walk_error(exc):
+        reports.append(FileResult(os.path.abspath(exc.filename or root),
+                                  status="failed", error="遍历失败: %s" % exc))
+
+    if os.path.isfile(target):
+        if eligible(target):
+            paths.append(target)
+    else:
+        truncated = False
+        try:
+            for directory, dirs, files in os.walk(target, onerror=walk_error):
+                dirs[:] = sorted(d for d in dirs
+                                 if d not in SKIP_DIRS and not d.startswith(".")
+                                 and not excluded(os.path.join(directory, d), True)
+                                 and not os.path.islink(os.path.join(directory, d)))
+                for name in sorted(files):
+                    path = os.path.join(directory, name)
+                    if not eligible(path):
+                        continue
+                    if len(paths) >= max_files:
+                        reports.append(FileResult(path, status="truncated",
+                                                  error="达到 --max-files，分析不完整"))
+                        truncated = True
+                        break
+                    paths.append(path)
+                if truncated:
+                    break
+        except OSError as exc:
+            walk_error(exc)
+    for path in sorted(set(paths)):
+        report = FileResult(path)
+        reports.append(report)
+        try:
+            report.findings = analyze_python_file(path)
+            if include_todos:
+                report.findings.extend(analyze_todos(path))
+            if report.findings:
+                report.status = "pending" if any(f.fixable for f in report.findings) else "manual"
+        except Exception as exc:
+            report.status, report.error = "failed", str(exc)
+    return sorted(reports, key=lambda r: r.path)
 
 
 def collect_findings(target: str, include_todos: bool = False,
-                     max_files: int = 500) -> List[Finding]:
-    """遍历目标文件/目录，汇总全部发现。"""
-    paths: List[str] = []
-    if os.path.isfile(target):
-        paths = [target]
-    else:
-        for root, dirs, files in os.walk(target):
-            dirs[:] = sorted(
-                d for d in dirs
-                if d not in SKIP_DIRS and not d.startswith(".")
-            )
-            for name in sorted(files):
-                if len(paths) >= max_files:
-                    break
-                paths.append(os.path.join(root, name))
-
-    findings: List[Finding] = []
-    for p in paths:
-        if detect_language(p) == "Python":
-            findings.extend(analyze_python_file(p))
-        if include_todos:
-            findings.extend(analyze_todos(p))
-    return findings
+                     max_files: int = 500,
+                     exclude: Optional[List[str]] = None) -> List[Finding]:
+    reports = _collect(target, include_todos, max_files, exclude)
+    errors = [r.path + ": " + r.error for r in reports if r.status in {"failed", "truncated"}]
+    if errors:
+        raise AnalysisError("; ".join(errors))
+    return [f for r in reports for f in r.findings]
 
 
-# ---------------------------------------------------------------------------
-# 应用修正
-# ---------------------------------------------------------------------------
-
-def apply_extra_param_removal(finding: Finding) -> bool:
-    """删除 docstring 中指向不存在参数的整行。
-
-    安全保证：只删除**确定属于该参数条目**的那一行；若该行在删除后
-    会让 docstring 变空，则改为替换为说明性文本而非留空。
-
-    Returns:
-        是否实际发生了修改。
-    """
-    if not finding.fixable or not finding.old_text:
-        return False
-    path = finding.path
-    # newline="" 保留原始行尾（CRLF 文件不会被悄悄改成 LF）
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        content = f.read()
-    lines = content.splitlines(keepends=True)
-    idx = finding.line - 1
-    if idx < 0 or idx >= len(lines):
-        return False
-    # 注意：old_text 来自 source.splitlines()，已经去掉了 \r\n；
-    # 而这里读到的行尾可能是 \r\n，必须两边都按 \r\n 归一化再比，
-    # 否则 CRLF 文件永远比对失败（修改静默不生效）。
-    if lines[idx].rstrip("\r\n") != finding.old_text.rstrip("\r\n"):
-        return False                     # 文件已变化，放弃
-    del lines[idx]
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write("".join(lines))
-    return True
+def _candidate(items: List[Finding]) -> tuple:
+    snapshot = items[0]._snapshot
+    if snapshot is None:
+        raise AnalysisError("缺少原始源码快照")
+    lines = _lines(snapshot.source)
+    removed = set()
+    for finding in sorted(items, key=lambda f: (f.line, f.end_line)):
+        if finding._snapshot != snapshot:
+            raise AnalysisError("同文件诊断的快照不一致")
+        if not (1 <= finding.line <= finding.end_line <= len(lines)):
+            raise AnalysisError("删除范围无效")
+        if "".join(lines[finding.line - 1:finding.end_line]) != finding.old_text:
+            raise AnalysisError("删除范围与原始条目不一致")
+        removed.update(range(finding.line - 1, finding.end_line))
+    candidate = "".join(line for i, line in enumerate(lines) if i not in removed)
+    ast.parse(candidate)
+    raw = candidate.encode(snapshot.encoding)
+    if raw == snapshot.raw:
+        raise AnalysisError("候选未产生修改")
+    return snapshot, raw
 
 
-def apply_findings(findings: List[Finding], verbose: bool = False) -> tuple:
-    """应用全部可修正项，返回 (修改文件数, 回滚文件数)。"""
-    fixable = [f for f in findings if f.fixable and f.kind == "param-extra"]
-    if not fixable:
-        return 0, 0
-
-    by_file: dict = {}
-    for f in fixable:
-        by_file.setdefault(f.path, []).append(f)
-
-    changed = rolled_back = 0
-    for path, items in by_file.items():
-        backup = path + ".stale.bak"
-        try:
-            shutil.copy2(path, backup)
-        except OSError as exc:
-            print("ERROR: 无法备份 %s: %s" % (path, exc), file=sys.stderr)
-            continue
-
-        # 从后往前删，避免行号偏移
-        applied = 0
-        for f in sorted(items, key=lambda x: -x.line):
-            if apply_extra_param_removal(f):
-                applied += 1
-
-        if not applied:
-            _safe_unlink(backup)
-            continue
-
-        # 自检：确认只动了注释
-        ok, detail = _verify(path, backup)
-        if ok:
-            changed += 1
-            _safe_unlink(backup)
-            if verbose:
-                print("  ✓ %s：修正 %d 处（%s）" % (path, applied, detail))
-        else:
-            shutil.copy2(backup, path)
-            rolled_back += 1
-            print("  ✗ %s：自检失败已回滚（%s）" % (path, detail), file=sys.stderr)
-            _safe_unlink(backup)
-
-    return changed, rolled_back
+def _write_temp(path: str, raw: bytes, mode: int, suffix: str,
+                created: List[str]) -> str:
+    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".stale.",
+                                     suffix=suffix, dir=os.path.dirname(path))
+    created.append(temporary)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary, mode)
+    return temporary
 
 
-def _safe_unlink(path: str) -> None:
+def _safe_unlink(path: str) -> bool:
     try:
         os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _verify(path: str, backup: str) -> tuple:
-    """调用 safety_check 校验修改后文件仅注释发生变化。
-
-    Returns:
-        ``(是否通过, 说明)``；校验器不可用时返回 (True, "已跳过校验")
-        以免因工具缺失阻塞流程（但会明确提示）。
-    """
-    checker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "safety_check.py")
+    checker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "safety_check.py")
     if not os.path.isfile(checker):
-        return True, "未找到 safety_check.py，已跳过自检"
+        return False, "未找到 safety_check.py"
     try:
         proc = subprocess.run(
-            [sys.executable, checker, backup, path],
+            [sys.executable, checker, backup, path, "--quiet"],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=60,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return True, "校验器执行失败(%s)，已跳过" % exc.__class__.__name__
-    if proc.returncode == 0:
-        return True, "SAFE"
-    return False, (proc.stdout or proc.stderr).strip().splitlines()[0] \
-        if (proc.stdout or proc.stderr).strip() else "UNSAFE"
+        output = (proc.stdout or "").strip()
+        if proc.returncode == 0 and output == "SAFE":
+            return True, "SAFE"
+        detail = output or (proc.stderr or "").strip() or "无 SAFE 判定"
+        return False, "校验失败（退出码 %s）: %s" % (proc.returncode, detail)
+    except Exception as exc:
+        return False, "校验器执行失败: %s: %s" % (type(exc).__name__, exc)
 
 
-# ---------------------------------------------------------------------------
-# 输出
-# ---------------------------------------------------------------------------
+def _apply_file(report: FileResult) -> None:
+    items = [f for f in report.findings if f.fixable and f.kind == "param-extra"
+             and not f.applied]
+    if not items or report.status in {"failed", "truncated"}:
+        return
+    created = []
+    backup = ""
+    committed = False
+    try:
+        snapshot, raw = _candidate(items)
+        if _read_snapshot(report.path) != snapshot:
+            raise AnalysisError("源文件已变化，未应用")
+        backup = _write_temp(report.path, snapshot.raw, snapshot.mode, ".bak", created)
+        temporary = _write_temp(report.path, raw, snapshot.mode, ".py", created)
+        ok, detail = _verify(temporary, backup)
+        if not ok:
+            raise AnalysisError(detail)
+        if (_read_snapshot(temporary).raw != raw
+                or _read_snapshot(backup).raw != snapshot.raw):
+            raise AnalysisError("校验期间候选或备份发生变化")
+        if _read_snapshot(report.path) != snapshot:
+            raise AnalysisError("源文件在提交前发生变化，未覆盖并发修改")
+        os.replace(temporary, report.path)
+        committed = True
+        created.remove(temporary)
+        for finding in items:
+            finding.applied = True
+        report.status = "partial" if any(not f.applied for f in report.findings) else "changed"
+    except Exception as exc:
+        report.status, report.error = "failed", str(exc)
+    finally:
+        for temporary in created:
+            if temporary == backup and not committed:
+                report.backup = backup
+                report.retained_files.append(backup)
+            elif not _safe_unlink(temporary):
+                report.retained_files.append(temporary)
+                if temporary == backup:
+                    report.backup = backup
 
-def render_text(findings: List[Finding], applied: bool) -> str:
-    """渲染人读文本报告。"""
-    if not findings:
-        return "未发现需要修正的过期注释。"
 
-    by_kind: dict = {}
-    for f in findings:
-        by_kind.setdefault(f.kind, []).append(f)
+def _group(findings: List[Finding]) -> List[FileResult]:
+    grouped = {}
+    for finding in findings:
+        grouped.setdefault(finding.path, FileResult(finding.path)).findings.append(finding)
+    for report in grouped.values():
+        if any(f.applied for f in report.findings):
+            report.status = "partial" if any(not f.applied for f in report.findings) else "changed"
+        else:
+            report.status = "pending" if any(f.fixable for f in report.findings) else "manual"
+    return [grouped[path] for path in sorted(grouped)]
 
-    labels = {
-        "param-extra": "文档多余的参数条目（可自动删除）",
-        "param-missing": "文档缺失的参数条目（需人工补写）",
-        "todo": "TODO / FIXME 积压",
+
+def apply_findings(findings: List[Finding], verbose: bool = False) -> List[FileResult]:
+    """返回真实逐文件结果；渲染报告时必须传递这些结果。"""
+    reports = _group([f for f in findings if not f.applied])
+    for report in reports:
+        _apply_file(report)
+        if verbose:
+            print("%s: %s" % (report.path, report.status), file=sys.stderr)
+        if report.error:
+            print("ERROR: %s: %s%s" % (
+                report.path, report.error,
+                "；备份: " + report.backup if report.backup else ""), file=sys.stderr)
+    return reports
+
+
+def _report_data(findings: List[Finding], apply_requested: bool,
+                 reports: List[FileResult]) -> dict:
+    changed = [r.path for r in reports if any(f.applied for f in r.findings)]
+    return {
+        "apply_requested": apply_requested, "applied": bool(changed),
+        "changed_files": changed,
+        "failed_files": [r.path for r in reports if r.status in {"failed", "truncated"}],
+        "complete": not any(r.status in {"failed", "truncated"} for r in reports),
+        "total": len(findings), "remaining": sum(not f.applied for f in findings),
+        "files": [r.to_dict() for r in reports],
+        "findings": [f.to_dict() for f in findings],
     }
 
-    out = ["# 过期注释修正建议", ""]
-    out.append("共发现 %d 项：%s" % (
-        len(findings),
-        "、".join("%s %d 项" % (labels.get(k, k), len(v))
-                  for k, v in sorted(by_kind.items())),
-    ))
-    out.append("")
 
-    for kind in ("param-extra", "param-missing", "todo"):
-        items = by_kind.get(kind)
-        if not items:
-            continue
-        out.append("## %s" % labels[kind])
-        out.append("")
-        for f in items:
-            loc = "%s:%d" % (f.path, f.line) if f.line else f.path
-            flag = "可自动修正" if f.fixable else "需人工处理"
-            out.append("- `%s` — `%s()` %s _(%s)_"
-                       % (loc, f.symbol, f.detail, flag))
-            if f.fixable and f.old_text:
-                out.append("  - 将删除：`%s`" % f.old_text.strip()[:120])
-        out.append("")
+def render_json(findings: List[Finding], apply_requested: bool,
+                reports: List[FileResult]) -> str:
+    return json.dumps(_report_data(findings, apply_requested, reports),
+                      ensure_ascii=False, indent=2)
 
-    if not applied:
-        out.append("---")
-        out.append("")
-        out.append("当前为 **试运行（dry-run）**，未修改任何文件。")
-        out.append("确认无误后加 `--apply` 才会写入，写入前会自动备份并自检。")
+
+def render_text(findings: List[Finding], apply_requested: bool,
+                reports: List[FileResult], verbose: bool = False) -> str:
+    failed = [r for r in reports if r.status in {"failed", "truncated"}]
+    out = ["过期注释修正报告" if findings or failed else "未发现需要修正的过期注释。"]
+    if verbose:
+        out.extend("%s: %s" % (r.path, r.status) for r in reports)
+    for finding in findings:
+        state = "已修正" if finding.applied else "可自动修正" if finding.fixable else "需人工处理"
+        out.append("%s:%d [%s] %s: %s（%s）" % (
+            finding.path, finding.line, finding.kind, finding.symbol, finding.detail, state))
+    for report in reports:
+        if report.error:
+            out.append("ERROR: %s: %s" % (report.path, report.error))
+        if report.retained_files:
+            out.append("保留文件: " + ", ".join(report.retained_files))
+    if apply_requested:
+        out.append("已修正 %d 个文件，失败 %d 个文件；剩余 %d 项。" % (
+            sum(any(f.applied for f in r.findings) for r in reports), len(failed),
+            sum(not f.applied for f in findings)))
+    else:
+        out.append("当前为 dry-run，未修改文件；确认后传入 --apply 才会备份、校验并写入。")
     return "\n".join(out)
 
 
-def render_json(findings: List[Finding], applied: bool) -> str:
-    return json.dumps({
-        "applied": applied,
-        "total": len(findings),
-        "findings": [f.to_dict() for f in findings],
-    }, ensure_ascii=False, indent=2)
-
-
 def render_diff(findings: List[Finding]) -> str:
-    """为可修正项生成统一 diff 预览。"""
-    out: List[str] = []
-    by_file: dict = {}
-    for f in findings:
-        if f.fixable and f.old_text:
-            by_file.setdefault(f.path, []).append(f)
-    for path, items in by_file.items():
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                lines = fh.read().splitlines(keepends=True)
-        except OSError:
+    out = []
+    for report in _group(findings):
+        items = [f for f in report.findings if f.fixable and f.kind == "param-extra"]
+        if not items:
             continue
-        removed = sorted({f.line for f in items})
-        diff = difflib.unified_diff(
-            lines,
-            [l for i, l in enumerate(lines, 1) if i not in removed],
-            fromfile=path, tofile=path + " (修正后)", n=2,
-        )
-        out.extend(diff)
+        snapshot, raw = _candidate(items)
+        out.extend(difflib.unified_diff(
+            _lines(snapshot.source), _lines(raw.decode(snapshot.encoding)),
+            fromfile=report.path, tofile=report.path + " (修正后)", n=2))
     return "".join(out)
 
 
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    if number <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return number
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="检测并修正与代码不一致的过期注释（默认 dry-run）",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="退出码：0 无需修正或已应用 / 1 存在待修正项(未应用) / "
-               "2 输入错误 / 3 自检失败已回滚",
-    )
+        description="检测过期注释；默认 dry-run，仅 --apply 才会写入",
+        epilog="退出码：0 无问题或全部修正 / 1 尚有诊断 / 2 输入错误 / 3 分析或修复失败")
     parser.add_argument("path", help="要检查的文件或目录")
-    parser.add_argument("--apply", action="store_true",
-                        help="实际写入修正（默认只预览）")
-    parser.add_argument("--diff", action="store_true",
-                        help="输出 unified diff 预览")
-    parser.add_argument("--include-todos", action="store_true",
-                        help="同时列出 TODO/FIXME 积压")
+    parser.add_argument("--apply", action="store_true", help="确认并应用可安全删除的参数条目")
+    parser.add_argument("--diff", action="store_true", help="输出 unified diff 预览")
+    parser.add_argument("--include-todos", action="store_true", help="同时报告 TODO/FIXME")
     parser.add_argument("--format", choices=("text", "json"), default="text")
-    parser.add_argument("--max-files", type=int, default=500)
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--max-files", type=_positive_int, default=500)
+    parser.add_argument("--exclude", action="append", default=[],
+                        help="排除相对扫描根的 POSIX glob，可重复")
+    parser.add_argument("--verbose", action="store_true",
+                        help="文本报告显示逐文件状态；JSON 始终包含这些状态")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-
-    if not os.path.exists(args.path):
-        print("错误：路径不存在 -> %s" % args.path, file=sys.stderr)
+    if not (os.path.isfile(args.path) or os.path.isdir(args.path)):
+        print("错误：路径不存在或不是文件/目录 -> %s" % args.path, file=sys.stderr)
         return 2
-
-    findings = collect_findings(args.path, args.include_todos, args.max_files)
-
+    try:
+        reports = _collect(args.path, args.include_todos, args.max_files, args.exclude)
+    except Exception as exc:
+        reports = [FileResult(os.path.abspath(args.path), status="failed", error=str(exc))]
+    findings = [f for report in reports for f in report.findings]
+    preview = ""
+    if args.diff:
+        for report in reports:
+            if report.status in {"failed", "truncated"}:
+                continue
+            try:
+                preview += render_diff(report.findings)
+            except Exception as exc:
+                report.status, report.error = "failed", "生成候选失败: %s" % exc
+    if args.apply:
+        for report in reports:
+            _apply_file(report)
     if args.format == "json":
-        text = render_json(findings, args.apply)
-    else:
-        text = render_text(findings, args.apply)
+        data = _report_data(findings, args.apply, reports)
         if args.diff:
-            d = render_diff(findings)
-            if d:
-                text += "\n\n## 修正预览（unified diff）\n\n```diff\n" + d + "```\n"
-
+            data["diff"] = preview
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+    else:
+        text = render_text(findings, args.apply, reports, verbose=args.verbose)
+        if preview:
+            text += "\n\n修正 diff：\n" + preview
     try:
         print(text)
     except UnicodeEncodeError:
         sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
-
-    if not args.apply:
-        return 1 if any(f.fixable for f in findings) else 0
-
-    changed, rolled = apply_findings(findings, args.verbose)
-    if args.format != "json":
-        print("\n已修正 %d 个文件，回滚 %d 个文件。" % (changed, rolled),
-              file=sys.stderr)
-    return 3 if rolled else 0
+    if any(report.status in {"failed", "truncated"} for report in reports):
+        return 3
+    return 1 if any(not f.applied for f in findings) else 0
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@
 
 零依赖，直接运行：
     python tests/test_skill.py
-    python -m pytest tests/ -q          # 若已安装 pytest
 
 覆盖范围：
 - 语言探测（含 .bak 备份文件名这一历史 bug）
@@ -321,7 +320,6 @@ def test_safety_check() -> None:
     check("Python 改逻辑 → UNSAFE",
           sc.compare("def f():\n    return 1\n",
                      "def f():\n    return 2\n", ".py", False)[0], "UNSAFE")
-    # 关键回归：语法错误文件 + docstring 新增，必须判 SAFE
     broken_old = "def parse_config(path)\n    return {}\n"
     broken_new = (
         '"""配置解析模块。"""\n'
@@ -332,8 +330,8 @@ def test_safety_check() -> None:
         '    """\n'
         "    return {}\n"
     )
-    check("语法错误文件 + 新增 docstring → SAFE",
-          sc.compare(broken_old, broken_new, ".py", False)[0], "SAFE")
+    check("语法错误文件 + 新增 docstring → UNVERIFIED",
+          sc.compare(broken_old, broken_new, ".py", False)[0], "UNVERIFIED")
     # 语法错误文件 + 改逻辑 → UNSAFE
     check("语法错误文件 + 改逻辑 → UNSAFE",
           sc.compare(broken_old,
@@ -440,6 +438,14 @@ def test_robustness() -> None:
             f.write("# 中文注释\n\ndef f():\n    return 1\n")
         r2 = cs.scan_file(gbk)
         check("GBK 文件可读", r2.skipped, False)
+        check("GBK 回退不误用 UTF-16", [s.name for s in r2.symbols], ["f"])
+        latin = os.path.join(tmp, "latin.py")
+        latin_source = '# coding: latin-1\ndef f():\n    """Résumé."""\n    pass\n'
+        with open(latin, "wb") as f:
+            f.write(latin_source.encode("latin-1"))
+        check("扫描器尊重编码声明", cs.read_text_safely(latin), latin_source)
+        check("校验器尊重编码声明", sc.read_text(latin), latin_source)
+        check("编码文件保留符号", [s.name for s in cs.scan_file(latin).symbols], ["f"])
 
         # 空文件
         empty = os.path.join(tmp, "empty.py")
@@ -503,6 +509,163 @@ def test_path_shortening() -> None:
     check("超长文件名截断后不超上限", len(got_huge) <= 50, True)
 
 
+def test_safety_regressions() -> None:
+    section("保守源码校验")
+    cases = [
+        ("JS 字符串内部空白", '.js', 'const x = "a  b";\n', 'const x = "a b";\n'),
+        ("C 标识符边界", '.c', 'int/**/x;\n', 'intx;\n'),
+        ("C 运算符边界", '.c', 'a+/**/+b;\n', 'a++b;\n'),
+        ("Python 缩进破坏", '.py', 'def f():\n    return 1\n', 'def f():\nreturn 1\n'),
+        ("Python 表达式字符串", '.py', 'def f()\n    "OLD".upper()\n',
+         'def f()\n    "NEW".upper()\n'),
+        ("Go 构建条件", '.go', '//go:build linux\n\npackage p\n',
+         '//go:build windows\n\npackage p\n'),
+        ("Go 编译指令", '.go', '//go:noinline\nfunc F() {}\n', 'func F() {}\n'),
+        ("Python type 指令", '.py', 'x = 1  # type: ignore\n', 'x = 1\n'),
+        ("Python shebang", '.py', '#!/usr/bin/python3\nx = 1\n', '#!/usr/bin/python2\nx = 1\n'),
+        ("Ruby 块后代码", '.rb', '=begin\ndoc\n=end\nx = 1\n', '=begin\ndoc\n=end\nx = 2\n'),
+        ("PowerShell 块后代码", '.ps1', '<# doc #>\n$x = 1\n', '<# doc #>\n$x = 2\n'),
+        ("Lua 块后代码", '.lua', '--[[ doc ]]\nx = 1\n', '--[[ doc ]]\nx = 2\n'),
+        ("Perl 块后代码", '.pl', '=pod\ndoc\n=cut\n$x = 1;\n', '=pod\ndoc\n=cut\n$x = 2;\n'),
+        ("JS 模板字符串", '.js', 'const s = `a\nb`;\n', 'const s = `a b`;\n'),
+        ("SQL 可执行注释", '.sql', '/*! SET x = 1 */\n', '/*! SET x = 2 */\n'),
+        ("不闭合块注释", '.js', '/* comment\nx = 1;\n', '/* comment\nx = 2;\n'),
+        ("未知语法", '.xyz', 'x = 1\n', 'x = 2\n'),
+        ("数字指数边界", '.c', 'double x = 1e + 2;\n', 'double x = 1e+2;\n'),
+        ("数字小数边界", '.js', 'const x = 1 .0;\n', 'const x = 1.0;\n'),
+        ("CR 行注释边界", '.js', 'x = 1;\r// doc\ry = 2;\r', 'x = 1;\r// doc\ry = 3;\r'),
+        ("Go 构建指令空行", '.go', '//go:build linux\n\npackage p\n', '//go:build linux\npackage p\n'),
+        ("C 函数宏间距", '.c', '#define F(x) x\n', '#define F (x) x\n'),
+        ("JS 注释换行影响 ASI", '.js', 'return/* doc\n*/value;\n', 'return/* doc */value;\n'),
+        ("Python 顶层 return", '.py', 'x = 1\n', 'return 1\n'),
+    ]
+    for label, ext, original, modified in cases:
+        verdict, _ = sc.compare(original, modified, ext, False)
+        check(label + " 不得 SAFE", verdict != "SAFE", True)
+    for language, spec in ls.LANG_SPECS.items():
+        pair_valid = ((spec.block_open is None and spec.block_close is None)
+                      or (isinstance(spec.block_open, str)
+                          and isinstance(spec.block_close, str)))
+        check(language + " 块注释规格成对", pair_valid, True)
+    positives = [
+        ('.c', 'int x;\n', '/** description */\nint x;\n'),
+        ('.go', 'package p\n', '// Package p describes p.\npackage p\n'),
+        ('.rb', '=begin\nold\n=end\nx = 1\n', '=begin\nnew\n=end\nx = 1\n'),
+        ('.lua', '--[[ old ]]\nx = 1\n', '--[[ new ]]\nx = 1\n'),
+    ]
+    for ext, original, modified in positives:
+        check(ext + " 普通注释可校验", sc.compare(original, modified, ext, False)[0], "SAFE")
+    for ext, source in (
+        ('.js', 'const r = /x/;\n'),
+        ('.cpp', 'const auto s = R"(text)";\n'),
+        ('.sh', 'cat <<EOF\ntext\nEOF\n'),
+    ):
+        check(ext + " 不支持构造明确未验证", sc.compare(source, source, ext, False)[0], "UNVERIFIED")
+
+
+def test_parameter_sections() -> None:
+    section("共享参数章节解析")
+    google = ('Summary.\n\nArgs:\n    a: first.\n        continued.\n'
+              '    obsolete: old.\n\nReturns:\n    int: value.\n'
+              'Raises:\n    ValueError: invalid.\n')
+    entries, has_section = cs.parse_doc_parameters(google)
+    check("Google 参数章节存在", has_section, True)
+    check("非参数章节不混入", [e.names for e in entries], [('a',), ('obsolete',)])
+    check("参数起始行保留", [e.start_line for e in entries], [4, 6])
+    check("说明续行属于参数", entries[0].end_line >= 5, True)
+    check("Returns 不属于参数", entries[-1].end_line < 8, True)
+    numpy = ('Summary.\n\nParameters\n----------\na, b : int\n    values.\n'
+             'obsolete : str\n    old.\n\nRaises\n------\nValueError\n    invalid.\n')
+    entries, has_section = cs.parse_doc_parameters(numpy)
+    check("NumPy 顶格参数章节", has_section, True)
+    check("NumPy 组合参数", [e.names for e in entries], [('a', 'b'), ('obsolete',)])
+    check("NumPy 参数起始行", [e.start_line for e in entries], [5, 7])
+    entries, has_section = cs.parse_doc_parameters('Summary.\n\nRaises:\n    ValueError: invalid.\n')
+    check("只有 Raises 没有参数章节", (entries, has_section), ([], False))
+    source = ('def f(a):\n    """Summary.\n\n    Args:\n        a: value.\n'
+              '    Raises:\n        ValueError: invalid.\n    """\n    return a\n')
+    report = cs.FileReport(path='sample.py', language='Python')
+    cs.scan_python_ast(source, report)
+    check("Raises 不触发参数漂移", report.warnings, [])
+    empty = cs.FileReport(path='empty.py', language='Python')
+    cs.scan_python_ast('def empty():\n    """   """\n    pass\n', empty)
+    check("空白 docstring 不计已文档", empty.symbols[0].documented, False)
+    check("空文档有结构化诊断", any(d['code'] == 'DOC001' for d in empty.diagnostics), True)
+    large = cs.FileReport(path='large.py', language='Python')
+    large.symbols = [cs.Symbol(name='f%d' % i, line=i + 1, documented=i < 4000)
+                     for i in range(4001)]
+    total, documented, coverage = cs._overall([large], True, False)
+    check("门禁原始计数", (total, documented), (4001, 4000))
+    check("缺失一个文档不能舍入为达标", coverage < 100, True)
+
+
+def test_scanner_contracts() -> None:
+    import json
+    section("扫描完整性与 CLI 边界")
+    with tempfile.TemporaryDirectory(prefix='scc-contract-') as tmp:
+        scanner = os.path.join(SCRIPTS, 'comment_scanner.py')
+        guard = os.path.join(SCRIPTS, 'safety_check.py')
+        def run(script, args):
+            return subprocess.run([sys.executable, script] + args, capture_output=True,
+                                  text=True, encoding='utf-8', errors='replace')
+        empty = run(scanner, [tmp, '--format', 'json'])
+        check("空目录仍为 JSON", isinstance(json.loads(empty.stdout), dict), True)
+        check("空目录普通扫描完成", empty.returncode, 0)
+        check("空目录门禁不可达标", run(scanner, [tmp, '--min-coverage', '0']).returncode, 3)
+        for threshold in ('nan', 'inf', '-1', '101'):
+            check("非法阈值 " + threshold, run(scanner, [tmp, '--min-coverage', threshold]).returncode, 2)
+        check("非法文件上限", run(scanner, [tmp, '--max-files', '0']).returncode, 2)
+        path = os.path.join(tmp, 'a.py')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('def documented():\n    """Summary."""\n    pass\n')
+        with open(os.path.join(tmp, '000.txt'), 'w', encoding='utf-8') as f:
+            f.write('not source')
+        check("非源码不占扫描额度",
+              run(scanner, [tmp, '--max-files', '1', '--min-coverage', '100']).returncode, 0)
+        with open(os.path.join(tmp, 'b.py'), 'w', encoding='utf-8') as f:
+            f.write('def missing():\n    pass\n')
+        check("候选源码截断不算成功", run(scanner, [tmp, '--max-files', '1']).returncode, 3)
+        check("主动排除不占额度", run(scanner, [tmp, '--max-files', '1', '--exclude', 'b.py']).returncode, 0)
+        check("单文件排除生效",
+              run(scanner, [path, '--exclude', 'a.py', '--min-coverage', '0']).returncode, 3)
+        listing = run(scanner, [tmp, '--include-covered']).stdout
+        check("同时列出缺失符号", 'missing' in listing, True)
+        check("同时列出已文档符号", 'documented' in listing, True)
+        broken = os.path.join(tmp, 'broken.py')
+        candidate = os.path.join(tmp, 'candidate.py')
+        with open(broken, 'w', encoding='utf-8') as f:
+            f.write('def f()\n    pass\n')
+        with open(candidate, 'w', encoding='utf-8') as f:
+            f.write('def f()\n    """Summary."""\n    pass\n')
+        check("未验证 CLI 退出 3", run(guard, [broken, candidate]).returncode, 3)
+        precision = os.path.join(tmp, 'precision.py')
+        with open(precision, 'w', encoding='utf-8') as f:
+            for i in range(4000):
+                f.write('def f%d():\n    """Summary."""\n    pass\n' % i)
+            f.write('def missing():\n    pass\n')
+        result = run(scanner, [precision, '--format', 'json', '--min-coverage', '100'])
+        check("4000/4001 的真实 CLI 门禁失败", result.returncode, 1)
+        check("门禁失败仍输出合法 JSON", isinstance(json.loads(result.stdout), dict), True)
+
+
+def test_documented_examples() -> None:
+    import re
+    section("文档中的成对示例")
+    for name, language, ext, expected in (
+        ('python', 'python', '.py', 'SAFE'),
+        ('java', 'java', '.java', 'SAFE'),
+        ('broken', 'python', '.py', 'UNVERIFIED'),
+    ):
+        versions = []
+        for kind in ('input', 'output'):
+            path = os.path.join(ROOT, 'examples', '%s-%s.md' % (kind, name))
+            with open(path, encoding='utf-8') as f:
+                text = f.read()
+            match = re.search(r'```' + language + r'\n(.*?)```', text, re.S)
+            versions.append(match.group(1))
+        check(name + " 示例校验", sc.compare(versions[0], versions[1], ext, False)[0], expected)
+
+
 def main() -> int:
     print("smart-code-commenter 自测")
     print("Python %s" % sys.version.split()[0])
@@ -516,6 +679,10 @@ def main() -> int:
     test_cli()
     test_robustness()
     test_path_shortening()
+    test_safety_regressions()
+    test_parameter_sections()
+    test_scanner_contracts()
+    test_documented_examples()
 
     print("\n" + "=" * 58)
     print("通过 %d 项，失败 %d 项" % (_PASS, _FAIL))

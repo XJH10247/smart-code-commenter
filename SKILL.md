@@ -1,8 +1,8 @@
 ---
 name: smart-code-commenter
-description: 为源代码自动生成高质量注释：文件头、函数/类文档注释（Docstring、JSDoc/TSDoc、Javadoc、godoc、rustdoc、KDoc 等原生风格）、复杂逻辑行内注释；内置覆盖率扫描、过期注释检测与修复、零逻辑变更安全校验。Use when the user asks to generate/add/write comments, docstrings, JSDoc, Javadoc, comment coverage, or fix stale comments；用户提到"生成注释"、"加注释"、"写注释"、"补注释"、"docstring"、"JSDoc"、"Javadoc"、"注释覆盖率"、"注释过期"、"comment"，或要求为代码/文件/项目补充文档注释时使用。
+description: 为源代码生成原生风格的文件头、函数/类文档注释和必要的复杂逻辑注释，提供覆盖率扫描、参数一致性检测、有限的过期参数修复及保守源码校验。Use when the user asks to generate/add/write comments, docstrings, JSDoc, Javadoc, comment coverage, or fix stale comments；用户要求生成注释、加注释、补注释、写文档字符串、检查注释覆盖率或修正过期注释时使用。
 license: MIT
-compatibility: Scripts require Python 3.8+ (stdlib only). Without Python the skill still works via prompt-only workflow.
+compatibility: Scripts require Python 3.8+ (stdlib only). Without Python, generate suggestions for manual review; automated verification is unavailable.
 metadata:
   version: "1.2.0"
   languages: "21"
@@ -11,201 +11,169 @@ metadata:
 
 # 智能代码注释生成器（Smart Code Commenter）
 
-为任意语言的源代码生成**符合语言原生规范**的高质量注释，并用工具链保证**只增注释、不改逻辑**。
+生成符合语言原生规范的注释，保持可执行代码不变；用辅助脚本检查可验证的源码结构，并明确报告无法验证的情况。
 
-## 触发条件
+## 触发与边界
 
-用户出现以下任一场景时使用本 Skill：
+用于代码片段、文件、目录或 git 改动中的注释生成、覆盖率检查和过期参数文档修复。
+文档格式包括 Docstring、JSDoc/TSDoc、Javadoc、godoc、rustdoc、KDoc、XML Doc、Doxygen 等。
 
-- 要求为某段代码、某个文件、某个目录"生成注释 / 加注释 / 补注释 / 写注释"
-- 提到 docstring、JSDoc、TSDoc、Javadoc、KDoc、godoc、rustdoc、XML Doc、Doxygen 等文档注释关键词
-- 要求"检查注释覆盖率"、"哪些函数没有注释"、"注释报告"、"注释门禁"
-- 要求"检查注释是否过期"、"注释和代码不一致"、"参数文档对不上"
-- 只为 git 改动部分补注释（增量模式）
+不要用于纯代码重构、改逻辑、生成测试、写 README/架构文档、翻译代码或审查 PR 评论。
 
-**不要使用**本 Skill：纯代码重构/改逻辑、生成测试、写 README/架构文档、翻译代码、审查 PR 评论（应优先用 code-review 类 skill）。
+## 核心原则
 
-## 核心原则（必须遵守）
-
-1. **零逻辑变更**：只允许新增/修改注释与文档字符串，严禁改动任何可执行代码、字符串字面量、导入语句。修改后用 `scripts/safety_check.py` 强制校验。
-2. **原生风格**：注释风格必须匹配语言生态惯例（见 `references/language-styles.md`），若项目已有注释风格，优先沿用项目现有风格。
-3. **解释 Why 而非 What**：行内注释解释意图、约束、边界条件，不复述代码字面含义（禁止 `i++  // i 加 1` 式注释）。
-4. **克制**：简单自解释代码不加行内注释；只为复杂算法、非常规写法、易错边界、魔法值添加。
-5. **语言一致**：注释语言跟随用户要求；未指定时，跟随项目已有注释的主要语言；全新项目默认中文。
-6. **不臆造参数**：文档注释中出现的每个参数名都必须与函数签名逐一核对，禁止凭空写入不存在的参数。
-7. **不泄漏密钥**：源码中的 API Key、密码、token 绝不写入注释；发现时提醒用户存在泄露风险。
+1. **只改说明性注释和真正的文档字符串**。不改可执行代码、普通字符串、导入或缩进结构；保留 shebang、编码声明、构建条件和其他工具指令。
+2. **先沿用项目风格**。按需读取 `references/language-styles.md` 的对应章节，不混用文档格式。
+3. **解释 Why，避免复述 What**。简单代码不补行内注释；只解释可确认的意图、约束和边界。
+4. **区分事实与推断**。逐一核对参数名；不猜测异常、线程安全、事务性或业务约束。无法确认的内容列入结果报告，不自动向源码写入 TODO 占位。
+5. **遵循用户的注释语言要求**。未指定时沿用项目主要注释语言，全新项目默认中文。
+6. **不泄漏密钥**。不将疑似密钥、密码或 token 写入注释或报告；只提醒存在泄露风险。
+7. **不要把检查通过说成行为等价证明**。Python docstring 可通过 `__doc__` 被程序读取；覆盖率也不代表注释内容真实。
 
 ## 操作步骤
 
-### 第 1 步：识别输入类型
+### 第 1 步：识别输入与范围
 
 | 输入 | 处理方式 |
 |------|---------|
-| 一段粘贴的代码 | 直接进入第 3 步生成注释，结果以代码块输出 |
-| 单个文件路径 | 读取文件后进入第 2 步 |
-| 目录 / 整个项目 | 先执行覆盖率扫描（第 2 步），按报告排序逐文件处理 |
-| git 增量（用户要求只注释改动） | 运行 `git diff --name-only HEAD` 与 `git diff -U0` 定位改动函数，只处理这些函数 |
+| 粘贴代码 | 生成建议，以代码块返回，不声称已通过文件校验 |
+| 单个文件 | 读取并扫描，再确认范围 |
+| 目录或项目 | 先扫描并呈现报告，取得范围确认后逐文件处理 |
+| git 增量 | 用下列同一基线的命令确定文件和改动块，只处理相关函数 |
 
-**异常输入防御**（遇到以下情况不要报错崩溃，给出友好说明并继续可处理的部分）：
+默认检查相对 HEAD 的暂存区与工作区合并改动：
 
-- 文件不存在 / 无读取权限 → 提示并跳过
-- 非代码文件（图片、二进制、数据文件）→ 说明不适用并跳过
-- 包含语法错误的代码 → 仍然生成注释（注释不依赖代码可运行），并在结果末尾提示发现的语法问题
-- 压缩 / 混淆 / 生成代码 → 提示该文件疑似生成物，询问是否仍要注释
-- 超大文件（> 2000 行）→ 分段处理，按函数/类为单位逐段完成
-- 空文件 / 纯注释文件 → 说明无需处理
+```bash
+git diff --name-only HEAD --
+git diff -U0 HEAD --
+```
 
-### 第 2 步：扫描注释覆盖率（文件/目录级输入时执行）
+用户只要求暂存区时，两条命令均加 `--cached`；只要求未暂存改动时，两条均去掉 `HEAD`。
+用 `git ls-files --others --exclude-standard` 单独列出未跟踪文件，不自动将其纳入范围。
+尚无 HEAD 的仓库不要套用上述基线，先根据已暂存和未跟踪文件确认范围。
 
-运行扫描脚本获取量化基线：
+遇到异常输入：
+
+- 不存在、无权限或非源码文件：说明并跳过；不要将读取失败视为检查通过。
+- 语法错误：仍可生成注释建议，但不得顺手修语法；文件校验可能为 `UNVERIFIED`，默认仅返回预览。
+- 压缩、混淆或生成代码：先询问是否处理。
+- 超过 2000 行：按函数或类分段；超过 10 MB：脚本不处理。
+- 空文件或纯注释文件：说明无需处理；没有可计符号时覆盖率不适用。
+
+### 第 2 步：扫描并解释报告
 
 ```bash
 python scripts/comment_scanner.py <路径> --format markdown
 ```
 
-脚本输出：注释覆盖率、未注释的函数/类清单、疑似过期注释（文档参数与签名不符、TODO/FIXME 积压）。
-按 `assets/templates/report.md` 模板向用户呈现报告，让用户确认处理范围后再继续。
-
-常用选项：
+按 `assets/templates/report.md` 呈现范围、排除项、跳过原因和完整性，让用户确认后再生成。
+分别说明文档存在率、参数结构诊断与需要人工判断的内容；不要合成一个“质量分数”。
 
 | 选项 | 用途 |
 |------|------|
-| `--format json` | 机器可读输出，供 CI 消费 |
-| `--min-coverage 80` | 覆盖率门禁：低于阈值时退出码为 1 |
-| `--no-private` | 把私有/半私有符号排除出分母（默认计入，对齐 interrogate 语义） |
-| `--include-tests` | 不跳过测试文件（默认跳过） |
-| `--include-covered` | 报告中一并列出已文档符号 |
+| `--format json` | 机器可读报告 |
+| `--min-coverage 80` | 用未舍入覆盖率判定门禁，低于阈值退出 1 |
+| `--no-private` | 将私有和半私有符号排除出分母 |
+| `--include-tests` | 不跳过测试文件 |
+| `--include-covered` | 同时列出缺失和已文档符号 |
+| `--max-files 500` | 合格源码候选上限；实际截断必须报告 |
+| `--exclude 'vendor/*'` | 按扫描根目录相对路径排除，可重复指定，使用 `/` 分隔 |
 
-> 脚本为纯 Python 标准库实现，无第三方依赖；若环境无 Python，跳过此步，直接人工分析文件。
+扫描退出码：`0` 完整扫描且满足门禁，`1` 覆盖率不足，`2` 输入错误，`3` 扫描不完整或门禁没有可计符号。
+出现 `3` 时先缩小范围、调整上限或处理读取错误，不得称为全项目已达标。
+排除 glob 大小写敏感；排除计数包含整个目录且只统计已遇到条目，截断后不要推算未扫描文件数。
+无 Python 时可人工分析，但不得编造覆盖率或标记自动校验通过。
 
 ### 第 3 步：生成三级注释
 
-按以下优先级顺序生成（用户指定级别时只做指定级别）：
+按用户范围和下列优先级处理：
 
-**Level 1 — 文件头注释**（文件缺失时添加）
-- 内容：模块职责一句话、主要对外能力、注意事项
-- 不写：作者、日期、版本（交给版本控制系统）
+**Level 1 — 文件头**：缺少时添加模块职责、主要对外能力和必要注意事项；不写作者、日期、版本；不移动 shebang、编码声明或构建指令。
 
-**Level 2 — API 文档注释**（所有 public 函数/类/方法）
-- 严格使用该语言的原生文档格式（各语言模板见 `references/language-styles.md`）
-- 必含：功能描述、每个参数含义与约束、返回值、可能抛出的异常/错误
-- 参数名必须与函数签名逐一核对，禁止臆造不存在的参数
-- 有类型注解/类型系统时，不在文档中重复写类型（交给语言自身）
+**Level 2 — 公开 API 文档**：描述功能及可确认的参数含义、返回值、异常或错误；不适用的章节不添加。以签名为参数事实来源；格式允许时省略类型系统已经表达的类型，不为省略类型破坏项目现有格式。
 
-**Level 3 — 行内逻辑注释**（仅复杂逻辑）
-- 触发条件：算法核心步骤、正则表达式、位运算、并发/锁、魔法值、绕过某 bug 的 workaround、非常规写法
-- 位置：被解释代码的上一行，与代码同缩进
+**Level 3 — 复杂逻辑说明**：只注释算法关键步骤、非显然的正则或位运算、并发约束、魔法值或必要 workaround。写在相关代码上一行并保持缩进，不推测未知业务原因。
 
-### 第 4 步：安全校验（修改文件后必须执行）
+### 第 4 步：校验候选后再替换
 
-对每个被修改的文件运行安全校验，确保只有注释变化。
+先保存原文件快照，并在单独候选文件上编辑。备份、候选路径必须不存在；需要唯一名称时保留真实语言扩展名，例如 `app.<唯一标识>.py.commenter.bak`。
+不要覆盖已有备份或用户的未提交改动。
 
-设原文件为 `app.py`，修改后为 `app.py.commenter.bak`（备份为原文件拷贝）时：
+假设原文件为 `app.py`，快照为 `app.py.commenter.bak`，候选为 `app.py.commenter.tmp`：
 
 ```bash
-# 参数顺序：原始文件(备份)  修改后文件
-python scripts/safety_check.py app.py app.py.commenter.bak
+python scripts/safety_check.py app.py.commenter.bak app.py.commenter.tmp --verbose
 ```
 
-- 输出 `SAFE`（退出码 0）：确认无逻辑变更，完成该文件
-- 输出 `UNSAFE`（退出码 1）：立即回滚该文件，重新只做注释修改
-- 加 `--verbose` 可打印首个差异位置，便于定位问题
+| 结果 | 操作 |
+|------|------|
+| `SAFE` / 0 | 在报告注明检查方式；确认原文件仍与快照一致后，才用候选替换原文件 |
+| `UNSAFE` / 1 | 不替换原件，检查候选中的非注释变更 |
+| 输入错误 / 2 | 保留原件，处理输入或读取问题 |
+| `UNVERIFIED` / 3 | 保留原件，只呈现预览和原因，交由人工复核；不得当作 `SAFE` |
 
-> **备份文件名的坑**：脚本已能识别 `.bak` / `.orig` / `.old` / `.commenter` 等备份后缀，
-> 因此 `app.js.commenter.bak` 会被正确识别为 JavaScript 而非未知语言。
-> 但**仍推荐**用 `<file>.commenter.bak` 这种保留真实扩展名的命名，可读性更好。
+替换前如果原件已被其他操作修改，停止并重新读取，不用快照覆盖并发改动。
+只清理本次创建且已不需要的临时文件；恢复失败时保留备份并报告其路径。
 
-标准校验流程：
+Python 有效语法使用去文档字符串后的 AST 比较；其他语言只做受支持词法范围内的保守比较。
+未知语言、无法可靠识别的字符串或注释语法可能无法验证。检查不执行目标代码，也不保证所有运行时行为相同。
+无 Python 时只能人工核对差异并报告“未自动验证”，不自动完成替换。
 
-```
-1. 复制原文件 → 备份（如 app.py → app.py.commenter.bak）
-2. 在「修改后文件」上写入带注释的内容
-3. 运行 safety_check.py <备份> <修改后文件>
-4. SAFE  → 用修改后文件覆盖原文件，删除备份
-   UNSAFE → 用备份覆盖回滚，检查差异后重试
-```
+### 第 5 步：输出真实结果
 
-**无 Python 环境时的替代做法**：用 `git diff` 逐行人工核对，确认每一处 `+`/`-` 行都只涉及注释。
+列出每个文件的新增文档/行内注释数量、实际写入状态、检查方式和结果。
+仅在扫描范围、排除配置一致且扫描完整时比较前后覆盖率；同时报告跳过、未验证、待确认事项。
+语法错误示例应写“已生成建议，尚未写入”，而不是“注释已完成且安全”。
 
-### 第 5 步：输出总结
+## 过期注释修复
 
-处理完成后向用户输出：
-
-```markdown
-## 注释生成完成
-
-| 文件 | 新增文档注释 | 新增行内注释 | 安全校验 |
-|------|------------|------------|---------|
-| src/foo.py | 5 | 3 | ✅ SAFE |
-
-- 覆盖率变化：42% → 91%
-- 跳过：static/logo（非代码文件）
-- 提醒：src/bar.py 第 88 行存在语法错误，已照常注释，建议修复
-```
-
-## 过期注释修复（可选，需用户确认）
-
-当用户要求"修掉过期注释"而非只检测时，使用 `scripts/fix_stale.py`。
-**该脚本默认 dry-run，只有显式加 `--apply` 才会写入文件**——这是刻意的安全默认值。
+仅在用户要求时修复，默认 dry-run；未取得写入授权不得加 `--apply`。
 
 ```bash
-# 第 1 步：先预览会改什么（dry-run，不动文件）
 python scripts/fix_stale.py ./src --diff
+```
 
-# 第 2 步：向用户展示待修正清单，取得确认
+确认预览和范围后：
 
-# 第 3 步：确认后写入（自动备份 → 修改 → 自检 → 通过则清理备份，失败则回滚）
+```bash
 python scripts/fix_stale.py ./src --apply --verbose
 ```
 
-能修与不能修的边界：
+| 类型 | 边界 |
+|------|------|
+| `param-extra` | 仅自动删除可准确定位的 Python Google/NumPy 多余参数完整条目 |
+| `param-missing` | 仅报告，不填占位或推测参数含义 |
+| `todo` | 指定 `--include-todos` 后仅报告；出现 TODO 不证明注释已过期 |
 
-| 类型 | 说明 | 是否自动修正 |
-|------|------|------------|
-| `param-extra` | 文档里记载了、但签名中已不存在的参数 | ✅ 删除该条目 |
-| `param-missing` | 签名中有、但文档未提及的参数 | ❌ 仅报告（补写内容需语义判断） |
-| `todo` | TODO / FIXME 积压（需 `--include-todos`） | ❌ 仅报告 |
+混合有效/失效参数的组合条目、转义或拼接造成位置不确定的文档字符串仅报告，不自动删除。
+修复器使用唯一备份和候选文件，必须通过安全校验且原文件未变化才替换；校验器缺失、超时或失败均阻止写入。
+用 `--format json` 查看实际应用结果，`apply_requested` 仅表示请求写入，不能代替 `applied` 和逐文件结果。
 
-**不要跳过用户确认直接 `--apply`**，除非用户已明确说"直接改"。
+退出码：`0` 无问题或全部修正成功，`1` 仍有未应用或需人工处理的问题，`2` 输入错误，`3` 分析不完整或修复失败。
+修复是逐文件事务，不是整个目录的一次事务；失败时已成功处理的其他文件不会撤销，须查看逐文件结果。
 
-## 支持的语言
+## 能力矩阵
 
-扫描与校验脚本内置 **21 种语言**规格、覆盖 **48 种文件扩展名**：
+语言规格登记 21 种语言、48 种扩展名；登记不代表每项能力同等支持。
 
-| 语言 | 文档注释风格 | 详细模板 |
-|------|------------|---------|
-| Python | Google 风格 Docstring（默认）/ NumPy / reST | references/language-styles.md §1 |
-| JavaScript / TypeScript | JSDoc / TSDoc | references/language-styles.md §2 |
-| Java | Javadoc | references/language-styles.md §3 |
-| Go | godoc 惯例 | references/language-styles.md §4 |
-| C / C++ | Doxygen | references/language-styles.md §5 |
-| Rust | rustdoc（`///` + Markdown） | references/language-styles.md §6 |
-| C# | XML 文档注释 | references/language-styles.md §7 |
-| Kotlin | KDoc | references/language-styles.md §8 |
-| PHP | PHPDoc | references/language-styles.md §9 |
-| Shell / PowerShell / SQL / YAML 等 | 行注释惯例 | references/language-styles.md §10 |
-| Ruby / Lua / R / Perl / Swift / Scala / Dart | 该语言行注释惯例 | references/language-styles.md §11 |
+| 输入 | 生成指导 | 存在率统计 | 参数一致性 | 源码校验 | 自动修复 |
+|------|----------|------------|------------|----------|----------|
+| Python，有效语法 | Google/NumPy/reST | AST，空文档不计入 | Google/NumPy 参数章节 | 去真正 docstring 后比较 AST，并保留指令约束 | 可定位的 Google/NumPy `param-extra` |
+| Python，语法错误 | 可生成预览 | 启发式，标明降级 | 不承诺 | 无法确认时 `UNVERIFIED` | 不支持 |
+| 其他已登记语言 | 原生风格 | 启发式，可能漏检或误检 | 不支持自动参数检查 | 受支持词法子集；不确定则 `UNVERIFIED` | 不支持 |
+| 未知语言 | 人工确认格式后建议 | 不支持 | 不支持 | `UNVERIFIED` | 不支持 |
 
-未列出的语言：采用该语言通用行注释符，参照 Level 1-3 原则生成。
+## 按需资源
 
-## 示例
+- `references/language-styles.md`：§1 Python；§2 JS/TS；§3 Java；§4 Go；§5 C/C++；§6 Rust；§7 C#；§8 Kotlin；§9 PHP；§10 脚本/配置；§11 Ruby/Lua/R/Perl/Swift/Scala/Dart。
+- `assets/templates/report.md`：报告模板。
+- `examples/input-python.md` → `examples/output-python.md`：Python 文档生成。
+- `examples/input-java.md` → `examples/output-java.md`：Java 文档生成。
+- `examples/input-broken.md` → `examples/output-broken.md`：语法错误时只生成预览。
 
-完整输入/输出示例见 `examples/` 目录：
+## 安全与限制
 
-- Python 函数补 Docstring：`examples/input-python.md` → `examples/output-python.md`
-- Java 遗留代码全量注释：`examples/input-java.md` → `examples/output-java.md`
-- 异常输入（语法错误代码）处理：`examples/input-broken.md` → `examples/output-broken.md`
-
-## 已知限制
-
-- 注释内容基于代码静态语义推断，无法获知运行时行为与业务背景；对含糊的业务逻辑会用中性描述并标注 `TODO(确认)` 供人工补充
-- 非 Python 语言使用启发式解析，极端代码风格下符号识别可能有少量遗漏（不影响注释生成，仅影响统计精度）
-- 不处理二进制、加密、超过 10 MB 的单文件
-- 过期注释自动修正目前仅覆盖 Python 的 `param-extra` 类型
-
-## 安全与合规
-
-- 全程本地处理，脚本不发起任何网络请求、不上传代码
-- 脚本只读分析 + 显式路径写入，不删除文件、不执行被分析的代码
-- `fix_stale.py` 写入前自动备份，写入后调用 `safety_check.py` 自检，失败自动回滚
-- 遇到源代码中疑似密钥/凭证（API Key、密码）时：不将其写入注释、不复述其值，并提醒用户存在泄露风险
+- 脚本仅使用标准库，不发网络请求、不执行被分析的代码；宿主模型是否远程处理源码由客户端配置决定，不能据脚本离线推断整个流程离线。
+- 扫描和校验只读；修复仅写明确指定的目标并清理自己创建的临时文件，不删除用户文件。
+- 模型无法从静态代码得知全部业务背景；正确参数名、覆盖率和 AST 一致都不证明说明文字准确。
+- 保持现有依赖与职责，不为本工作流安装第三方文档工具，不未经测量引入缓存或并行扫描。

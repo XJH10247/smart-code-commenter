@@ -23,6 +23,7 @@
     0  扫描完成且满足门禁
     1  扫描完成但覆盖率低于 --min-coverage
     2  输入错误（路径不存在等）
+    3  扫描不完整，或带门禁但没有可计符号
 
 设计约束：
 - 仅使用 Python 标准库，零第三方依赖；
@@ -46,12 +47,16 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
+import io
 import json
+import math
 import os
 import re
 import sys
+import tokenize
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # 允许以脚本方式直接运行（无需安装为包）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -239,6 +244,9 @@ class FileReport:
     skipped: bool = False
     skip_reason: str = ""
     parse_mode: str = "heuristic"      # ast / tokenize / heuristic
+    diagnostics: List[Dict[str, object]] = field(default_factory=list)
+    status: str = "scanned"           # scanned / skipped / excluded / truncated / error
+    complete: bool = True
 
     # -- 覆盖率计算 ---------------------------------------------------------
 
@@ -291,14 +299,7 @@ class FileReport:
 # ---------------------------------------------------------------------------
 
 def read_text_safely(path: str) -> Optional[str]:
-    """读取文本文件；依次尝试 utf-8(-sig) / utf-16 / gbk / big5 / latin-1。
-
-    通过 NUL 字节与解码成功率判定是否为二进制文件；超过
-    ``MAX_FILE_BYTES`` 的文件直接跳过。
-
-    Returns:
-        文件文本；无法作为文本读取时返回 None。
-    """
+    """优先按 BOM 或声明编码读取，再回退；失败返回 None。"""
     try:
         with open(path, "rb") as f:
             raw = f.read(MAX_FILE_BYTES + 1)
@@ -306,12 +307,25 @@ def read_text_safely(path: str) -> Optional[str]:
         return None
     if len(raw) > MAX_FILE_BYTES:
         return None
-    if b"\x00" in raw[:4096] and not raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return None                       # 二进制文件（UTF-16 除外）
-    for enc in ("utf-8-sig", "utf-16", "utf-8", "gbk", "big5", "latin-1"):
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeError:
+            return None
+    if b"\x00" in raw[:4096]:
+        return None
+    header = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
+    header = b"\n".join(header.split(b"\n", 2)[:2])
+    if re.search(br"(?m)^[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+", header):
+        try:
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+            return raw.decode(encoding)
+        except (UnicodeError, SyntaxError, LookupError):
+            return None
+    for enc in ("utf-8-sig", "gbk", "big5", "latin-1"):
         try:
             return raw.decode(enc)
-        except (UnicodeDecodeError, UnicodeError, LookupError):
+        except (UnicodeError, LookupError):
             continue
     return None
 
@@ -610,6 +624,100 @@ def find_doc_block_above(lines: List[str], index: int, spec) -> bool:
 # Python：基于 AST 的精确分析
 # ---------------------------------------------------------------------------
 
+@dataclass
+class DocParameter:
+    """参数条目；行号为传入 doc 文本的 1-based、两端包含区间。"""
+
+    names: Tuple[str, ...]
+    start_line: int
+    end_line: int
+
+
+_GOOGLE_PARAMETERS = frozenset({"Args", "Arguments", "Keyword Args"})
+_NUMPY_PARAMETERS = frozenset({"Parameters", "Other Parameters"})
+_DOC_HEADINGS = _GOOGLE_PARAMETERS | _NUMPY_PARAMETERS | frozenset({
+    "Returns", "Return", "Yields", "Yield", "Raises", "Raise", "Warns",
+    "Warnings", "Warning", "Attributes", "Methods", "Notes", "Note",
+    "Examples", "Example", "See Also", "References", "Todo", "Details",
+})
+_DOC_NAME = r"\*{0,2}[^\W\d]\w*"
+_GOOGLE_PARAMETER = re.compile(
+    r"^(" + _DOC_NAME + r")\s*(?:\([^)]*\))?\s*:\s*.*$"
+)
+_NUMPY_PARAMETER = re.compile(
+    r"^(" + _DOC_NAME + r"(?:\s*,\s*" + _DOC_NAME + r")*)(?:\s*:\s*.*)?$"
+)
+
+
+def _doc_sections(lines: List[str]) -> List[Tuple[int, int, str, bool]]:
+    """返回顶层章节 (标题下标, 正文下标, 风格, 是否为参数章节)。"""
+    body_indents = [_indent_of(s) for s in lines[1:] if s.strip()]
+    margin = min(body_indents) if body_indents else 0
+    if (lines and lines[0].strip().rstrip(":") in _DOC_HEADINGS
+            and lines[0].strip().rstrip(":") not in _GOOGLE_PARAMETERS | _NUMPY_PARAMETERS):
+        margin = min(margin, _indent_of(lines[0]))
+    sections = []
+    for i, line in enumerate(lines):
+        title = line.strip()
+        if not title or (i != 0 and _indent_of(line) > margin):
+            continue
+        if (i + 1 < len(lines)
+                and re.fullmatch(r"-{3,}", lines[i + 1].strip())
+                and (i == 0 or _indent_of(lines[i + 1]) == _indent_of(line))
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9 _-]*", title)):
+            sections.append((i, i + 2, "numpy", title in _NUMPY_PARAMETERS))
+        elif title.endswith(":") and title[:-1] in _DOC_HEADINGS:
+            sections.append((i, i + 1, "google", title[:-1] in _GOOGLE_PARAMETERS))
+    return sections
+
+
+def parse_doc_parameters(doc: str) -> Tuple[List[DocParameter], bool]:
+    """仅解析 Google/NumPy 参数章节；保留原行号，参数名去掉 * 前缀。"""
+    lines = [line.expandtabs() for line in doc.splitlines()]
+    sections = _doc_sections(lines)
+    entries: List[DocParameter] = []
+    found = False
+    for index, (header, start, style, supported) in enumerate(sections):
+        if not supported:
+            continue
+        found = True
+        stop = sections[index + 1][0] if index + 1 < len(sections) else len(lines)
+        header_indent = _indent_of(lines[header])
+        entry_indent = None
+        current = None
+        pattern = _GOOGLE_PARAMETER if style == "google" else _NUMPY_PARAMETER
+        for i in range(start, stop):
+            text = lines[i].strip()
+            if not text:
+                if current is not None:
+                    current.end_line = i + 1
+                continue
+            indent = _indent_of(lines[i])
+            if indent < header_indent or (style == "google" and indent == header_indent):
+                break
+            if entry_indent is None:
+                entry_indent = indent
+            if indent < entry_indent:
+                break
+            if indent == entry_indent:
+                match = pattern.fullmatch(text)
+                if match is None:
+                    break                       # 不把同级说明文字并入可删除条目
+                names = tuple(name.strip().lstrip("*") for name in match.group(1).split(","))
+                current = DocParameter(names, i + 1, i + 1)
+                entries.append(current)
+            elif current is not None:
+                current.end_line = i + 1
+    return entries, found
+
+
+def _diagnose(report: FileReport, code: str, node, message: str) -> None:
+    report.diagnostics.append({
+        "code": code, "line": node.lineno, "symbol": node.name, "message": message,
+    })
+    report.warnings.append(message)
+
+
 def _visitor_to_symbol(node, name: str, kind: str, documented: bool,
                        end_line: int = -1) -> Symbol:
     if name.startswith("__") and name.endswith("__"):
@@ -637,6 +745,7 @@ def scan_python_ast(source: str, report: FileReport) -> bool:
             "Python 语法解析失败（%s），已降级为启发式统计，精度下降"
             % exc.__class__.__name__
         )
+        report.complete = False
         return False
 
     report.parse_mode = "ast"
@@ -644,73 +753,53 @@ def scan_python_ast(source: str, report: FileReport) -> bool:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         kind = "class" if isinstance(node, ast.ClassDef) else "function"
-        documented = ast.get_docstring(node) is not None
+        doc = ast.get_docstring(node)
+        documented = bool((doc or "").strip())
         end = getattr(node, "end_lineno", -1) or -1
         report.symbols.append(
             _visitor_to_symbol(node, node.name, kind, documented, end)
         )
+        if doc is not None and not documented:
+            _diagnose(report, "DOC001", node,
+                      "第 %d 行 %s: docstring 为空或仅含空白" % (node.lineno, node.name))
         if documented and not isinstance(node, ast.ClassDef):
             _check_doc_drift(node, report)
     return True
 
 
 def _check_doc_drift(node, report: FileReport) -> None:
-    """检测 docstring 记载的参数与真实签名不一致（过期注释信号）。
-
-    同时识别 Google 风格（``Args:`` 下 ``name:``）与 NumPy 风格
-    （``Parameters`` 下 ``name : type``）两种写法。
-    """
-    doc = ast.get_docstring(node) or ""
-    real_args = {a.arg for a in node.args.posonlyargs}
-    real_args |= {a.arg for a in node.args.args}
-    real_args |= {a.arg for a in node.args.kwonlyargs}
+    """按共享章节解析结果检查参数名称；仅在顺序确定时报告 PAR003。"""
+    doc = ast.get_docstring(node, clean=False) or ""
+    entries, has_section = parse_doc_parameters(doc)
+    if not has_section:
+        return
+    args = list(node.args.posonlyargs) + list(node.args.args)
     if node.args.vararg:
-        real_args.add(node.args.vararg.arg)
+        args.append(node.args.vararg)
+    args.extend(node.args.kwonlyargs)
     if node.args.kwarg:
-        real_args.add(node.args.kwarg.arg)
-    real_args |= {"self", "cls"}
-
-    _SECTION_WORDS = {
-        "returns", "raises", "args", "arguments", "yields", "note", "notes",
-        "example", "examples", "attributes", "parameters", "other",
-        "see", "seealso", "references", "warns", "warning", "todo",
-        "keyword", "kwargs", "return", "raise", "yield", "parameters",
-    }
-
-    # Google 风格：`name: desc` / `name (type): desc`
-    for m in re.finditer(r"^\s{2,}(\*{0,2}\w+)\s*(?:\([^)]*\))?\s*:\s+\S", doc,
-                         re.MULTILINE):
-        name = m.group(1).lstrip("*")
-        if name.lower() in _SECTION_WORDS or name in real_args:
-            continue
-        if name.startswith(("**", "*")):
-            continue
-        report.warnings.append(
-            "第 %d 行 %s(): docstring 记载的参数 '%s' 不在函数签名中，注释疑似过期"
-            % (node.lineno, node.name, name)
-        )
-
-    # NumPy 风格：`name : type`
-    for m in re.finditer(r"^\s{0,8}(\w+)\s*:\s*[\w\[\], ]+\s*$", doc, re.MULTILINE):
-        name = m.group(1)
-        if name.lower() in _SECTION_WORDS or name in real_args:
-            continue
-        report.warnings.append(
-            "第 %d 行 %s(): NumPy 风格 docstring 中的 '%s' 不在函数签名中，注释疑似过期"
-            % (node.lineno, node.name, name)
-        )
-
-    # 反向检查：签名中有参数但 docstring 完全没提（仅在有 Args/Parameters 段时报）
-    if re.search(r"^\s*(Args|Arguments|Parameters)\b", doc, re.MULTILINE):
-        undocumented = [
-            a for a in sorted(real_args - {"self", "cls"})
-            if not re.search(r"(?<![\w.])%s\s*(?:\(|:)" % re.escape(a), doc)
-        ]
-        if undocumented:
-            report.warnings.append(
-                "第 %d 行 %s(): 参数 %s 未在 docstring 中说明"
-                % (node.lineno, node.name, ", ".join(repr(a) for a in undocumented))
-            )
+        args.append(node.args.kwarg)
+    real = [a.arg for a in args if a.arg not in {"self", "cls"}]
+    named = [name for entry in entries for name in entry.names if name not in {"self", "cls"}]
+    real_set, named_set = set(real), set(named)
+    for name in dict.fromkeys(named):
+        if name not in real_set:
+            _diagnose(report, "PAR002", node,
+                      "第 %d 行 %s(): docstring 记载的参数 '%s' 不在函数签名中，注释疑似过期"
+                      % (node.lineno, node.name, name))
+    missing = [name for name in real if name not in named_set]
+    if missing:
+        _diagnose(report, "PAR001", node,
+                  "第 %d 行 %s(): 参数 %s 未在 docstring 中说明"
+                  % (node.lineno, node.name, ", ".join(repr(a) for a in missing)))
+    sections = _doc_sections([line.expandtabs() for line in doc.splitlines()])
+    if (len(named) > 1 and len(named) == len(named_set)
+            and named_set == real_set and named != real
+            and all(len(entry.names) == 1 for entry in entries)
+            and sum(1 for section in sections if section[3]) == 1):
+        _diagnose(report, "PAR003", node,
+                  "第 %d 行 %s(): docstring 参数顺序与函数签名不一致"
+                  % (node.lineno, node.name))
 
 
 def scan_python_fallback(source: str, report: FileReport) -> None:
@@ -836,30 +925,41 @@ def _looks_minified(lines: List[str]) -> bool:
     return long_lines >= 3 and long_lines / sampled > 0.02
 
 
+def _skip_report(report: FileReport, status: str, reason: str) -> FileReport:
+    report.skipped = True
+    report.status = status
+    report.skip_reason = reason
+    report.complete = status not in {"error", "truncated"}
+    return report
+
+
 def scan_file(path: str, skip_tests: bool = True) -> FileReport:
     """扫描单个文件；任何内部异常都被捕获并转为 skipped 状态。"""
+    return _scan_file(os.fspath(path), skip_tests)
+
+
+def _scan_file(path: str, skip_tests: bool, limit_reached: bool = False) -> FileReport:
     report = FileReport(path=path)
     try:
         if skip_tests and _TEST_PATH_RE.search(path):
-            report.skipped = True
-            report.skip_reason = "测试文件（可用 --include-tests 纳入）"
-            return report
+            return _skip_report(report, "excluded", "测试文件（可用 --include-tests 纳入）")
+        report.language = detect_language(path)
+        if limit_reached and report.language != "Unknown":
+            return _skip_report(report, "truncated", "达到 --max-files，仍有合格源码文件")
 
         source = read_text_safely(path)
         if source is None:
-            report.skipped = True
-            report.skip_reason = "无法读取（二进制/超大/编码不可识别/权限不足）"
-            return report
-        if not source.strip():
-            report.skipped = True
-            report.skip_reason = "空文件"
-            return report
-
+            return _skip_report(
+                report, "error" if report.language != "Unknown" else "skipped",
+                "无法读取（二进制/超大/编码不可识别/权限不足）",
+            )
         report.language = detect_language(path, source)
         if report.language == "Unknown":
-            report.skipped = True
-            report.skip_reason = "未识别的源码类型"
-            return report
+            return _skip_report(report, "skipped", "未识别的源码类型")
+        if limit_reached:
+            return _skip_report(report, "truncated", "达到 --max-files，仍有合格源码文件")
+        if not source.strip():
+            return _skip_report(report, "skipped", "空文件")
 
         lines = source.splitlines()
         report.total_lines = len(lines)
@@ -888,28 +988,88 @@ def scan_file(path: str, skip_tests: bool = True) -> FileReport:
                     "80% 以上符号为私有/半私有，覆盖率按公开 API 口径可能失真"
                 )
     except Exception as exc:  # 兜底：单文件失败绝不影响整体
-        report.skipped = True
-        report.skip_reason = "解析异常: %s: %s" % (exc.__class__.__name__, exc)
+        _skip_report(report, "error", "解析异常: %s: %s" % (exc.__class__.__name__, exc))
     return report
 
 
+def _is_excluded(relative: str, patterns: List[str], directory: bool = False) -> bool:
+    return any(fnmatch.fnmatchcase(relative, pattern)
+               or (directory and fnmatch.fnmatchcase(relative + "/", pattern))
+               for pattern in patterns)
+
+
 def scan_path(target: str, max_files: int,
-              skip_tests: bool = True) -> List[FileReport]:
-    """扫描文件或目录，返回全部文件报告（按路径排序，结果稳定）。"""
+              skip_tests: bool = True,
+              exclude: Optional[List[str]] = None) -> List[FileReport]:
+    """返回文件报告及排除/截断/错误哨兵；用 scan_status 汇总完整性。"""
+    if not isinstance(max_files, int) or max_files <= 0:
+        raise ValueError("max_files 必须为正整数")
+    target = os.path.abspath(os.fspath(target))
+    if not os.path.isfile(target) and not os.path.isdir(target):
+        raise ValueError("路径不是可扫描的文件或目录: %s" % target)
+    patterns = list(exclude or [])
     reports: List[FileReport] = []
     if os.path.isfile(target):
+        if _is_excluded(os.path.basename(target), patterns):
+            return [_skip_report(FileReport(target), "excluded", "匹配 --exclude")]
         return [scan_file(target, skip_tests)]
 
-    for root, dirs, files in os.walk(target):
-        dirs[:] = sorted(
-            d for d in dirs
-            if d not in SKIP_DIRS and not d.startswith(".")
-        )
-        for name in sorted(files):
-            if len(reports) >= max_files:
-                return reports
-            reports.append(scan_file(os.path.join(root, name), skip_tests))
+    attempted = 0
+
+    def walk_error(exc: OSError) -> None:
+        reports.append(_skip_report(FileReport(str(exc.filename or target)), "error",
+                                    "目录读取失败: %s" % exc))
+
+    try:
+        for root, dirs, files in os.walk(target, onerror=walk_error):
+            kept = []
+            for name in sorted(dirs):
+                path = os.path.join(root, name)
+                relative = os.path.relpath(path, target).replace("\\", "/")
+                reason = ""
+                if _is_excluded(relative, patterns, directory=True):
+                    reason = "匹配 --exclude"
+                elif name in SKIP_DIRS or name.startswith("."):
+                    reason = "默认排除目录"
+                elif skip_tests and _TEST_PATH_RE.search(path):
+                    reason = "测试目录（可用 --include-tests 纳入）"
+                elif os.path.islink(path):
+                    reason = "符号链接目录（不递归）"
+                if reason:
+                    reports.append(_skip_report(FileReport(path), "excluded", reason))
+                else:
+                    kept.append(name)
+            dirs[:] = kept
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                relative = os.path.relpath(path, target).replace("\\", "/")
+                if _is_excluded(relative, patterns):
+                    report = _skip_report(FileReport(path), "excluded", "匹配 --exclude")
+                elif attempted < max_files:
+                    report = scan_file(path, skip_tests)
+                else:
+                    report = _scan_file(path, skip_tests, limit_reached=True)
+                reports.append(report)
+                if report.status == "truncated":
+                    return reports
+                if (not report.skipped or report.status == "error"
+                        or (report.status == "skipped" and report.language != "Unknown")):
+                    attempted += 1
+    except OSError as exc:
+        walk_error(exc)
     return reports
+
+
+def scan_status(reports: List[FileReport]) -> Dict[str, object]:
+    """统计已遇到的文件/目录条目；截断后未遍历的条目不计数。"""
+    return {
+        "scanned": sum(not r.skipped for r in reports),
+        "skipped": sum(r.skipped and r.status not in {"excluded", "truncated"} for r in reports),
+        "excluded": sum(r.status == "excluded" for r in reports),
+        "truncated": any(r.status == "truncated" for r in reports),
+        "errors": sum(not r.complete and r.status != "truncated" for r in reports),
+        "complete": all(r.complete for r in reports),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -944,17 +1104,29 @@ def _overall(scanned: List[FileReport], include_private: bool,
     """汇总总体覆盖率，返回 (符号总数, 已文档数, 覆盖率)。"""
     total = documented = 0
     for r in scanned:
+        if r.skipped:
+            continue
         for s in r.counted_symbols(include_private, include_tests):
             total += 1
             if s.documented:
                 documented += 1
-    pct = round(documented / total * 100, 1) if total else 0.0
+    pct = documented / total * 100 if total else None
     return total, documented, pct
+
+
+def _coverage_text(coverage: Optional[float]) -> str:
+    return "%.1f%%" % coverage if coverage is not None else "未适用"
+
+
+def _status_text(reports: List[FileReport]) -> str:
+    return " ".join("%s=%s" % (key, str(value).lower())
+                    for key, value in scan_status(reports).items())
 
 
 def render_markdown(reports: List[FileReport], include_private: bool = True,
                     include_tests: bool = False,
-                    show_undocumented: bool = True) -> str:
+                    show_undocumented: bool = True,
+                    include_covered: bool = False, quiet: bool = False) -> str:
     """按 assets/templates/report.md 的结构渲染 Markdown 报告。"""
     scanned = [r for r in reports if not r.skipped]
     skipped = [r for r in reports if r.skipped]
@@ -966,9 +1138,12 @@ def render_markdown(reports: List[FileReport], include_private: bool = True,
     total_code = sum(r.code_lines for r in scanned)
 
     out = ["# 注释覆盖率报告", ""]
-    out.append("- 扫描文件：%d 个（跳过 %d 个）" % (len(scanned), len(skipped)))
+    out.append("- 扫描状态：%s" % _status_text(reports))
+    out.append("- 扫描文件：%d 个（未扫描条目 %d 个）" % (len(scanned), len(skipped)))
     out.append("- 可注释符号：%d 个，已有文档注释：%d 个" % (total_symbols, total_doc))
-    out.append("- **总体文档覆盖率：%.1f%%**" % overall)
+    out.append("- **总体文档覆盖率：%s**" % _coverage_text(overall))
+    if quiet:
+        return "\n".join(out)
     if total_code:
         out.append("- 注释行占比：%.1f%%（%d 注释行 / %d 代码行）"
                    % (total_comment / total_code * 100, total_comment, total_code))
@@ -1017,6 +1192,19 @@ def render_markdown(reports: List[FileReport], include_private: bool = True,
             if len(undocumented) > 100:
                 out.append("- …… 其余 %d 项省略" % (len(undocumented) - 100))
             out.append("")
+
+    if include_covered:
+        covered = [(r.path, s) for r in scanned
+                   for s in r.counted_symbols(include_private, include_tests) if s.documented]
+        out.extend(["## 已有文档注释的符号", ""])
+        for path, s in covered[:100]:
+            out.append("- `%s:%d` — %s `%s`"
+                       % (_escape_md(path), s.line, _escape_md(s.kind), _escape_md(s.name)))
+        if not covered:
+            out.append("- 无")
+        if len(covered) > 100:
+            out.append("- …… 其余 %d 项省略" % (len(covered) - 100))
+        out.append("")
 
     todo_items = [(r.path, t) for r in scanned for t in r.todos]
     if todo_items:
@@ -1068,43 +1256,72 @@ def _shorten_path(path: str, width: int = 50) -> str:
 
 
 def render_text(reports: List[FileReport], include_private: bool = True,
-                include_tests: bool = False) -> str:
+                include_tests: bool = False, include_covered: bool = False,
+                quiet: bool = False) -> str:
     """精简终端输出。"""
     scanned = [r for r in reports if not r.skipped]
     total, documented, overall = _overall(scanned, include_private, include_tests)
     lines = [
-        "扫描 %d 个文件 | 符号 %d 个 | 已文档 %d 个 | 覆盖率 %.1f%%"
-        % (len(scanned), total, documented, overall)
+        "coverage=%s | 扫描 %d 个文件 | 符号 %d 个 | 已文档 %d 个"
+        % (_coverage_text(overall), len(scanned), total, documented),
+        _status_text(reports),
     ]
+    if quiet:
+        return "\n".join(lines)
     for r in sorted(
         scanned,
-        key=lambda x: (x.doc_coverage(include_private, include_tests) or 101),
+        key=lambda x: (x.doc_coverage(include_private, include_tests)
+                       if x.doc_coverage(include_private, include_tests) is not None else 101),
     ):
         cov = r.doc_coverage(include_private, include_tests)
-        if cov is None:
-            continue
         counted = len(r.counted_symbols(include_private, include_tests))
-        lines.append("  %6.1f%%  %-50s (%d 符号)"
-                     % (cov, _shorten_path(r.path, 50), counted))
+        lines.append("  %7s  %-50s (%d 符号)"
+                     % (_coverage_text(cov), _shorten_path(r.path, 50), counted))
+    for documented_state, title in ((False, "缺少文档注释的符号"), (True, "已有文档注释的符号")):
+        if documented_state and not include_covered:
+            continue
+        items = [(r.path, s) for r in scanned
+                 for s in r.counted_symbols(include_private, include_tests)
+                 if s.documented == documented_state]
+        if items or documented_state:
+            lines.append(title + ":")
+            for path, s in items[:100]:
+                lines.append("  %s:%d %s %s" % (path, s.line, s.kind, s.name))
+            if not items:
+                lines.append("  无")
+            if len(items) > 100:
+                lines.append("  …… 其余 %d 项省略" % (len(items) - 100))
+    for r in reports:
+        if r.skipped:
+            lines.append("  [%s] %s: %s" % (r.status, r.path, r.skip_reason))
+        for warning in r.warnings:
+            lines.append("  %s: %s" % (r.path, warning))
     return "\n".join(lines)
 
 
 def render_json(reports: List[FileReport], include_private: bool = True,
-                include_tests: bool = False) -> str:
+                include_tests: bool = False, include_covered: bool = False,
+                quiet: bool = False) -> str:
     """渲染 JSON 报告（供程序化消费 / CI 集成）。"""
     scanned = [r for r in reports if not r.skipped]
     total, documented, overall = _overall(scanned, include_private, include_tests)
+    status = scan_status(reports)
     payload = {
         "summary": {
-            "files_scanned": len(scanned),
-            "files_skipped": len(reports) - len(scanned),
+            "files_scanned": status["scanned"],
+            "files_skipped": status["skipped"],
             "symbols": total,
             "documented": documented,
+            "undocumented": total - documented,
             "coverage_pct": overall,
+            **status,
         },
-        "files": [],
     }
+    if quiet:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    payload["files"] = []
     for r in reports:
+        counted = r.counted_symbols(include_private, include_tests) if not r.skipped else []
         item = {
             "path": r.path,
             "language": r.language,
@@ -1113,13 +1330,19 @@ def render_json(reports: List[FileReport], include_private: bool = True,
             "comment_lines": r.comment_lines,
             "blank_lines": r.blank_lines,
             "parse_mode": r.parse_mode,
-            "coverage_pct": r.doc_coverage(include_private, include_tests),
+            "coverage_pct": r.doc_coverage(include_private, include_tests) if not r.skipped else None,
             "symbols": [asdict(s) for s in r.symbols],
+            "undocumented_symbols": [asdict(s) for s in counted if not s.documented],
             "todos": r.todos,
             "warnings": r.warnings,
+            "diagnostics": r.diagnostics,
             "skipped": r.skipped,
             "skip_reason": r.skip_reason,
+            "status": r.status,
+            "complete": r.complete,
         }
+        if include_covered:
+            item["covered_symbols"] = [asdict(s) for s in counted if s.documented]
         payload["files"].append(item)
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -1133,54 +1356,60 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="注释覆盖率扫描器（只读，零依赖）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="退出码：0 正常 / 1 低于 --min-coverage / 2 输入错误",
+        epilog="退出码：0 正常 / 1 低于门禁 / 2 输入错误 / 3 扫描不完整或门禁无可计符号",
     )
     parser.add_argument("path", help="要扫描的文件或目录")
     parser.add_argument("--format", choices=("markdown", "json", "text"),
                         default="markdown", help="输出格式（默认 markdown）")
     parser.add_argument("--max-files", type=int, default=500,
-                        help="目录扫描的文件数上限（默认 500）")
+                        help="合格源码文件扫描上限（正整数，默认 500）")
+    parser.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                        help="排除相对扫描根目录的 POSIX 路径 glob（可重复；单文件使用文件名）")
     parser.add_argument("--min-coverage", type=float, default=None,
                         metavar="PCT",
-                        help="覆盖率门禁：低于该百分比时退出码为 1")
+                        help="覆盖率门禁：0..100 的有限数，低于时退出码为 1")
     parser.add_argument("--no-private", action="store_true",
                         help="将私有/半私有符号排除出分母")
     parser.add_argument("--include-tests", action="store_true",
                         help="不跳过测试文件")
     parser.add_argument("--include-covered", action="store_true",
-                        help="markdown 报告中列出已文档符号（默认只列缺失项）")
+                        help="保留缺失符号列表，并另列已文档符号")
     parser.add_argument("--quiet", action="store_true",
-                        help="只输出摘要行")
+                        help="只输出摘要和扫描状态（JSON 格式保持有效 JSON）")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-
-    if not os.path.exists(args.path):
-        print("错误：路径不存在 -> %s" % args.path, file=sys.stderr)
+    if args.max_files <= 0:
+        print("错误：--max-files 必须为正整数", file=sys.stderr)
+        return 2
+    if (args.min_coverage is not None
+            and (not math.isfinite(args.min_coverage) or not 0 <= args.min_coverage <= 100)):
+        print("错误：--min-coverage 必须为 0..100 的有限数", file=sys.stderr)
+        return 2
+    if not os.path.isfile(args.path) and not os.path.isdir(args.path):
+        print("错误：路径不是可扫描的文件或目录 -> %s" % args.path, file=sys.stderr)
         return 2
 
-    reports = scan_path(args.path, max(1, args.max_files),
-                        skip_tests=not args.include_tests)
-    if not reports:
-        print("提示：未发现可扫描的文件。")
-        return 0
+    try:
+        reports = scan_path(args.path, args.max_files,
+                            skip_tests=not args.include_tests, exclude=args.exclude)
+    except ValueError as exc:
+        print("错误：%s" % exc, file=sys.stderr)
+        return 2
+    except OSError as exc:
+        reports = [_skip_report(FileReport(os.path.abspath(args.path)), "error", str(exc))]
 
     include_private = not args.no_private
     include_tests = args.include_tests
-
-    if args.quiet:
-        scanned = [r for r in reports if not r.skipped]
-        _, _, overall = _overall(scanned, include_private, include_tests)
-        text = "coverage=%.1f%%" % overall
-    elif args.format == "json":
-        text = render_json(reports, include_private, include_tests)
-    elif args.format == "text":
-        text = render_text(reports, include_private, include_tests)
+    render_options = {"include_covered": args.include_covered, "quiet": args.quiet}
+    if args.format == "json":
+        text = render_json(reports, include_private, include_tests, **render_options)
+    elif args.format == "text" or args.quiet:
+        text = render_text(reports, include_private, include_tests, **render_options)
     else:
-        text = render_markdown(reports, include_private, include_tests,
-                               show_undocumented=not args.include_covered)
+        text = render_markdown(reports, include_private, include_tests, **render_options)
 
     try:
         print(text)
@@ -1188,15 +1417,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Windows GBK 控制台兜底
         sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
 
+    if not scan_status(reports)["complete"]:
+        print("INCOMPLETE: 扫描不完整，不能判定门禁通过", file=sys.stderr)
+        return 3
     if args.min_coverage is not None:
-        scanned = [r for r in reports if not r.skipped]
-        _, _, overall = _overall(scanned, include_private, include_tests)
-        if overall < args.min_coverage:
-            print("FAIL: 覆盖率 %.1f%% 低于门禁 %.1f%%"
-                  % (overall, args.min_coverage), file=sys.stderr)
+        total, documented, overall = _overall(reports, include_private, include_tests)
+        if overall is None:
+            print("N/A: 无可计符号，覆盖率门禁未适用", file=sys.stderr)
+            return 3
+        numerator, denominator = args.min_coverage.as_integer_ratio()
+        if documented * 100 * denominator < total * numerator:
+            print("FAIL: 覆盖率 %.12g%% (%d/%d) 低于门禁 %.12g%%"
+                  % (overall, documented, total, args.min_coverage), file=sys.stderr)
             return 1
-        print("PASS: 覆盖率 %.1f%% 达到门禁 %.1f%%"
-              % (overall, args.min_coverage), file=sys.stderr)
+        print("PASS: 覆盖率 %.12g%% (%d/%d) 达到门禁 %.12g%%"
+              % (overall, documented, total, args.min_coverage), file=sys.stderr)
     return 0
 
 
